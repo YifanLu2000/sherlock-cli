@@ -422,4 +422,6 @@ def main(argv: list[str] | None = None) -> int:
         console.print()
         console.print("[yellow]Interrupted.[/yellow]")
         return 130
+    finally:
+        service.close()
     return 0

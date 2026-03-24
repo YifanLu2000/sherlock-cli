@@ -1,6 +1,5 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
 import unittest
 
 from sherlock_cli.config import load_config
@@ -9,63 +8,57 @@ from sherlock_cli.service import SherlockService
 from sherlock_cli.state import StateStore
 
 
-class FakeRunner:
+class FakeRemoteShell:
     def __init__(self):
-        self.calls = []
-        self.fail_next_control_socket_call = False
+        self.commands = []
+        self.uploads = []
+        self.closed = False
 
-    def __call__(self, args, capture_output=True, text=True):
-        self.calls.append(args)
-        command = " ".join(args)
-        if self.fail_next_control_socket_call and args[0] == "ssh":
-            self.fail_next_control_socket_call = False
-            return SimpleNamespace(
-                returncode=255,
-                stdout="",
-                stderr="Control socket connect(/tmp/sherlock.sock): Connection refused",
-            )
+    def run(self, command, check=True):
+        self.commands.append((command, check))
         if "printf '%s' \"$HOME\"" in command:
-            return SimpleNamespace(returncode=0, stdout="/home/demo", stderr="")
+            return "/home/demo"
         if "mkdir -p" in command:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        if args[0] == "scp":
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return ""
         if "sbatch --parsable" in command:
-            return SimpleNamespace(returncode=0, stdout="4321\n", stderr="")
+            return "4321"
         if "squeue -u" in command:
-            return SimpleNamespace(
-                returncode=0,
-                stdout="4321|GPU-jupyterlab|RUNNING|gpu|sh03-01|00:03:12\n9999|other|PENDING|normal|(Priority)|00:00\n",
-                stderr="",
+            return (
+                "4321|GPU-jupyterlab|RUNNING|gpu|sh03-01|00:03:12\n"
+                "9999|other|PENDING|normal|(Priority)|00:00"
             )
         if "scontrol show job -o 4321" in command:
-            return SimpleNamespace(
-                returncode=0,
-                stdout=(
-                    "JobId=4321 JobName=GPU-jupyterlab JobState=RUNNING Partition=gpu "
-                    "NodeList=sh03-01 Reason=None RunTime=00:03:12 "
-                    "StdOut=/home/demo/forward-util/GPU-jupyterlab-4321.out "
-                    "StdErr=/home/demo/forward-util/GPU-jupyterlab-4321.err"
-                ),
-                stderr="",
+            return (
+                "JobId=4321 JobName=GPU-jupyterlab JobState=RUNNING Partition=gpu "
+                "NodeList=sh03-01 Reason=None RunTime=00:03:12 "
+                "StdOut=/home/demo/forward-util/GPU-jupyterlab-4321.out "
+                "StdErr=/home/demo/forward-util/GPU-jupyterlab-4321.err"
             )
         if "tail -n 200" in command or "tail -n 60" in command:
-            return SimpleNamespace(
-                returncode=0,
-                stdout="http://sh03-01:56793/lab?token=abc123\n",
-                stderr="",
-            )
+            return "http://sh03-01:56793/lab?token=abc123"
         if "scancel 4321" in command:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return ""
         if "squeue -j 4321" in command:
-            return SimpleNamespace(
-                returncode=0,
-                stdout="4321|GPU-jupyterlab|RUNNING|gpu|sh03-01|00:03:12\n",
-                stderr="",
-            )
+            return "4321|GPU-jupyterlab|RUNNING|gpu|sh03-01|00:03:12"
         if "sacct -j 4321" in command:
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return ""
+        return ""
+
+    def write_text(self, remote_path, content):
+        self.uploads.append((remote_path, content))
+
+    def close(self):
+        self.closed = True
+
+
+class FakeSessionFactory:
+    def __init__(self):
+        self.sessions = []
+
+    def __call__(self):
+        session = FakeRemoteShell()
+        self.sessions.append(session)
+        return session
 
 
 class FakePopen:
@@ -78,20 +71,20 @@ class ServiceTests(unittest.TestCase):
     def make_service(self, tmpdir: str):
         config = load_config()
         config.state_path = Path(tmpdir) / "state.json"
-        runner = FakeRunner()
+        session_factory = FakeSessionFactory()
         service = SherlockService(
             config,
             StateStore(config.state_path),
-            runner=runner,
             popen_factory=FakePopen,
+            ssh_session_factory=session_factory,
             sleeper=lambda _seconds: None,
             browser_opener=lambda _url: None,
         )
-        return service, runner
+        return service, session_factory
 
     def test_submit_job_records_state(self):
         with TemporaryDirectory() as tmpdir:
-            service, runner = self.make_service(tmpdir)
+            service, session_factory = self.make_service(tmpdir)
             preset = service.config.presets["xiaojie-gpu"]
             request = SubmissionRequest(
                 preset=preset,
@@ -113,14 +106,16 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(job_id, "4321")
             metadata = service.state.get("4321")
             self.assertIsNotNone(metadata)
-            self.assertTrue(any(call[0] == "scp" for call in runner.calls))
-            scp_call = next(call for call in runner.calls if call[0] == "scp")
-            self.assertIn("ControlMaster=auto", scp_call)
-            self.assertTrue(any(part.startswith("ControlPath=") for part in scp_call))
+            self.assertEqual(len(session_factory.sessions), 1)
+            session = session_factory.sessions[0]
+            self.assertEqual(len(session.uploads), 1)
+            remote_path, content = session.uploads[0]
+            self.assertTrue(remote_path.endswith("/GPU-jupyterlab.sbatch"))
+            self.assertIn("#!/bin/bash", content)
 
-    def test_list_and_connect_job(self):
+    def test_list_and_connect_job_reuses_single_session(self):
         with TemporaryDirectory() as tmpdir:
-            service, _runner = self.make_service(tmpdir)
+            service, session_factory = self.make_service(tmpdir)
             service.state.record_submission(
                 job_id="4321",
                 job_name="GPU-jupyterlab",
@@ -138,21 +133,27 @@ class ServiceTests(unittest.TestCase):
             self.assertIsInstance(info.local_port, int)
             self.assertGreater(info.local_port, 0)
             self.assertEqual(info.local_url, f"http://localhost:{info.local_port}/lab?token=abc123")
+            self.assertEqual(len(session_factory.sessions), 1)
+            session = session_factory.sessions[0]
+            commands = [command for command, _check in session.commands]
+            self.assertTrue(any("squeue -u" in command for command in commands))
+            self.assertTrue(any("scontrol show job -o 4321" in command for command in commands))
 
-    def test_stale_control_socket_retries_once(self):
+    def test_close_disposes_current_session(self):
         with TemporaryDirectory() as tmpdir:
-            service, runner = self.make_service(tmpdir)
-            runner.fail_next_control_socket_call = True
-
-            jobs = service.list_jobs()
-
-            self.assertEqual(len(jobs), 2)
-            ssh_calls = [call for call in runner.calls if call[0] == "ssh"]
-            self.assertGreaterEqual(len(ssh_calls), 2)
+            service, session_factory = self.make_service(tmpdir)
+            service.list_jobs()
+            self.assertEqual(len(session_factory.sessions), 1)
+            session = session_factory.sessions[0]
+            self.assertFalse(session.closed)
+            service.close()
+            self.assertTrue(session.closed)
+            service.list_jobs()
+            self.assertEqual(len(session_factory.sessions), 2)
 
     def test_kill_job_clears_tunnel(self):
         with TemporaryDirectory() as tmpdir:
-            service, _runner = self.make_service(tmpdir)
+            service, _session_factory = self.make_service(tmpdir)
             service.state.record_submission(
                 job_id="4321",
                 job_name="GPU-jupyterlab",
