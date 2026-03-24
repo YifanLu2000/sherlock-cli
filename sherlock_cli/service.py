@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shlex
 import signal
@@ -44,6 +45,16 @@ class SherlockService:
         self.browser_opener = browser_opener or webbrowser.open
         self._remote_home: str | None = None
         self._remote_util_dir: str | None = None
+        socket_key = "|".join(
+            [
+                self.config.connection.resource,
+                self.config.connection.domain_name,
+                self.config.connection.forward_username,
+            ]
+        )
+        socket_hash = hashlib.sha1(socket_key.encode("utf-8")).hexdigest()[:12]
+        self._ssh_control_path = self.config.state_path.parent / f"ssh-{socket_hash}.sock"
+        self._ssh_control_persist_seconds = 600
 
     def list_jobs(self) -> list[JobInfo]:
         output = self._ssh_output(
@@ -98,13 +109,7 @@ class SherlockService:
             raise SherlockError(f"sbatch template not found: {template_path}")
 
         remote_template = f"{remote_util_dir}/{template_path.name}"
-        self._run(
-            [
-                "scp",
-                str(template_path),
-                f"{self.config.connection.resource}:{remote_template}",
-            ]
-        )
+        self._run(self._scp_to_remote(template_path, remote_template))
 
         stdout_pattern = f"{remote_util_dir}/{request.job_name}-%j.out"
         stderr_pattern = f"{remote_util_dir}/{request.job_name}-%j.err"
@@ -353,15 +358,59 @@ class SherlockService:
     def _shell_join(args: list[str]) -> str:
         return " ".join(shlex.quote(arg) for arg in args)
 
+    def _ssh_multiplex_options(self) -> list[str]:
+        return [
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            f"ControlPersist={self._ssh_control_persist_seconds}",
+            "-o",
+            f"ControlPath={self._ssh_control_path}",
+        ]
+
     def _remote_bash(self, command: str) -> list[str]:
         return [
             "ssh",
+            *self._ssh_multiplex_options(),
             self.config.connection.resource,
             f"bash -lc {shlex.quote(command)}",
         ]
 
+    def _scp_to_remote(self, local_path: Path, remote_path: str) -> list[str]:
+        return [
+            "scp",
+            *self._ssh_multiplex_options(),
+            str(local_path),
+            f"{self.config.connection.resource}:{remote_path}",
+        ]
+
+    def _remove_stale_control_socket(self) -> None:
+        try:
+            self._ssh_control_path.unlink()
+        except FileNotFoundError:
+            return
+
+    @staticmethod
+    def _is_stale_control_socket_error(message: str) -> bool:
+        indicators = (
+            "Control socket connect(",
+            "mux_client_request_session:",
+            "master is dead",
+        )
+        failures = (
+            "Connection refused",
+            "Broken pipe",
+            "No such file or directory",
+        )
+        return any(item in message for item in indicators) and any(item in message for item in failures)
+
     def _run(self, args: list[str], *, check: bool = True):
         result = self.runner(args, capture_output=True, text=True)
+        if result.returncode != 0 and args and args[0] in {"ssh", "scp"}:
+            message = "\n".join(part for part in [result.stderr, result.stdout] if part)
+            if self._is_stale_control_socket_error(message):
+                self._remove_stale_control_socket()
+                result = self.runner(args, capture_output=True, text=True)
         if check and result.returncode != 0:
             raise SherlockError(result.stderr.strip() or result.stdout.strip() or f"Command failed: {args}")
         return result

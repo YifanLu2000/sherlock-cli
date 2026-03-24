@@ -12,10 +12,18 @@ from sherlock_cli.state import StateStore
 class FakeRunner:
     def __init__(self):
         self.calls = []
+        self.fail_next_control_socket_call = False
 
     def __call__(self, args, capture_output=True, text=True):
         self.calls.append(args)
         command = " ".join(args)
+        if self.fail_next_control_socket_call and args[0] == "ssh":
+            self.fail_next_control_socket_call = False
+            return SimpleNamespace(
+                returncode=255,
+                stdout="",
+                stderr="Control socket connect(/tmp/sherlock.sock): Connection refused",
+            )
         if "printf '%s' \"$HOME\"" in command:
             return SimpleNamespace(returncode=0, stdout="/home/demo", stderr="")
         if "mkdir -p" in command:
@@ -106,6 +114,9 @@ class ServiceTests(unittest.TestCase):
             metadata = service.state.get("4321")
             self.assertIsNotNone(metadata)
             self.assertTrue(any(call[0] == "scp" for call in runner.calls))
+            scp_call = next(call for call in runner.calls if call[0] == "scp")
+            self.assertIn("ControlMaster=auto", scp_call)
+            self.assertTrue(any(part.startswith("ControlPath=") for part in scp_call))
 
     def test_list_and_connect_job(self):
         with TemporaryDirectory() as tmpdir:
@@ -127,6 +138,17 @@ class ServiceTests(unittest.TestCase):
             self.assertIsInstance(info.local_port, int)
             self.assertGreater(info.local_port, 0)
             self.assertEqual(info.local_url, f"http://localhost:{info.local_port}/lab?token=abc123")
+
+    def test_stale_control_socket_retries_once(self):
+        with TemporaryDirectory() as tmpdir:
+            service, runner = self.make_service(tmpdir)
+            runner.fail_next_control_socket_call = True
+
+            jobs = service.list_jobs()
+
+            self.assertEqual(len(jobs), 2)
+            ssh_calls = [call for call in runner.calls if call[0] == "ssh"]
+            self.assertGreaterEqual(len(ssh_calls), 2)
 
     def test_kill_job_clears_tunnel(self):
         with TemporaryDirectory() as tmpdir:

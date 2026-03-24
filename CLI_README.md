@@ -57,6 +57,7 @@ Menu controls:
 - in interactive mode, press `Ctrl+C` twice within 2 seconds to exit
 
 The menu now fetches Sherlock job status once per screen refresh. Moving left and right does not trigger a new SSH query.
+Remote `ssh` and `scp` operations also reuse a persistent OpenSSH control connection for about 10 minutes, so repeated actions avoid paying the full `ssh sherlock` setup cost each time.
 
 When an action needs a specific job, the CLI opens a second selector:
 
