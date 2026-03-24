@@ -1,0 +1,128 @@
+[connection]
+resource = "sherlock"
+domain_name = "login.sherlock.stanford.edu"
+forward_username = "luyifan"
+email = "luyifan@stanford.edu"
+machine_prefix = "sh"
+default_notebook_dir = "/oak/stanford/groups/xiaojie/yifan"
+remote_util_dir = "~/forward-util"
+use_kerberos = true
+
+[state]
+path = "~/.local/state/sherlock-cli/state.json"
+
+[watch]
+poll_interval_seconds = 5
+startup_timeout_seconds = 300
+
+[[presets]]
+id = "xiaojie-cpu"
+label = "Xiaojie CPU"
+job_name = "CPU-jupyterlab"
+sbatch_script = "sbatches/CPU-jupyterlab.sbatch"
+partition = "xiaojie"
+cpus = 8
+mem = "64G"
+time = "72:00:00"
+port = 56790
+nodelist = "sh04-05n13"
+isolated_compute_node = true
+
+[[presets]]
+id = "xiaojie-gpu"
+label = "Xiaojie GPU"
+job_name = "GPU-jupyterlab"
+sbatch_script = "sbatches/GPU-jupyterlab.sbatch"
+partition = "xiaojie"
+cpus = 16
+gpus = 1
+mem = "256G"
+time = "96:00:00"
+port = 56793
+nodelist = "sh04-04n05"
+gpu_cmode = "shared"
+gres_flags = "disable-binding"
+isolated_compute_node = true
+
+[[presets]]
+id = "general-cpu"
+label = "General CPU"
+job_name = "general-CPU-jupyterlab"
+sbatch_script = "sbatches/CPU-jupyterlab.sbatch"
+partition = "normal"
+cpus = 8
+mem = "64G"
+time = "24:00:00"
+port = 56795
+isolated_compute_node = true
+
+[[presets]]
+id = "general-gpu"
+label = "General GPU"
+job_name = "Sherlock-GPU-jupyterlab"
+sbatch_script = "sbatches/Sherlock-GPU-jupyterlab.sbatch"
+partition = "gpu"
+cpus = 16
+gpus = 1
+mem = "128G"
+time = "24:00:00"
+port = 56794
+constraint = "GPU_MEM:40GB|GPU_MEM:48GB|GPU_MEM:80GB"
+gpu_cmode = "shared"
+gres_flags = "disable-binding"
+isolated_compute_node = true
+
+[[presets]]
+id = "owner-cpu"
+label = "Owner CPU"
+job_name = "owner-CPU-jupyterlab"
+sbatch_script = "sbatches/owner-CPU-jupyterlab.sbatch"
+partition = "owners"
+cpus = 64
+mem = "256G"
+time = "24:00:00"
+port = 56791
+isolated_compute_node = true
+
+[[presets]]
+id = "owner-gpu"
+label = "Owner GPU"
+job_name = "owner-GPU-jupyterlab"
+sbatch_script = "sbatches/owner-GPU-jupyterlab.sbatch"
+partition = "owners"
+cpus = 16
+gpus = 1
+mem = "128G"
+time = "24:00:00"
+port = 56792
+constraint = "GPU_MEM:24GB|GPU_MEM:32GB|GPU_MEM:48GB|GPU_MEM:80GB"
+gpu_cmode = "shared"
+gres_flags = "disable-binding"
+isolated_compute_node = true
+
+[[presets]]
+id = "bigmem"
+label = "Bigmem CPU"
+job_name = "CPU-BIGMEM-jupyterlab"
+sbatch_script = "sbatches/CPU-BIGMEM-jupyterlab.sbatch"
+partition = "bigmem"
+cpus = 8
+mem = "256G"
+time = "12:00:00"
+port = 56798
+isolated_compute_node = false
+
+[[presets]]
+id = "stanford-gpu"
+label = "Stanford GPU"
+job_name = "Stanford-GPU-jupyterlab"
+sbatch_script = "sbatches/Stanford-GPU-jupyterlab.sbatch"
+partition = "gpu"
+cpus = 8
+gpus = 1
+mem = "64G"
+time = "24:00:00"
+port = 56796
+gpu_cmode = "shared"
+gres_flags = "disable-binding"
+isolated_compute_node = true

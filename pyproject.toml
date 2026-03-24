@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sherlock-cli"
+version = "0.1.0"
+description = "Interactive CLI for managing Sherlock Jupyter jobs"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "rich>=13.7.0",
+  "tomli>=2.0.1; python_version < '3.11'",
+]
+
+[project.scripts]
+sherlock-cli = "sherlock_cli.cli:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["sherlock_cli*"]

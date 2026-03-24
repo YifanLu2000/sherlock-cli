@@ -1,0 +1,425 @@
+from __future__ import annotations
+
+import argparse
+import sys
+import termios
+import time
+import tty
+from dataclasses import dataclass
+from dataclasses import replace
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.text import Text
+from rich.table import Table
+
+from .config import load_config
+from .models import JobLogs, Preset, SubmissionRequest
+from .service import SherlockError, SherlockService
+from .state import StateStore
+
+
+console = Console()
+MENU_ACTIONS = [
+    ("r", "Refresh"),
+    ("n", "New"),
+    ("c", "Connect"),
+    ("w", "Watch"),
+    ("k", "Kill"),
+    ("l", "Logs"),
+    ("q", "Quit"),
+]
+INTERRUPT_EXIT_WINDOW_SECONDS = 2.0
+
+
+@dataclass
+class InterruptTracker:
+    last_interrupt_at: float | None = None
+
+
+def should_exit_on_interrupt(
+    tracker: InterruptTracker,
+    *,
+    now: float | None = None,
+    window_seconds: float = INTERRUPT_EXIT_WINDOW_SECONDS,
+) -> bool:
+    current = time.monotonic() if now is None else now
+    if tracker.last_interrupt_at is None or current - tracker.last_interrupt_at > window_seconds:
+        tracker.last_interrupt_at = current
+        return False
+    tracker.last_interrupt_at = None
+    return True
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sherlock-cli", description="Manage Sherlock Jupyter jobs")
+    parser.add_argument("--config", help="Path to sherlock_presets.toml")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    list_parser = subparsers.add_parser("list", help="List pending and running jobs")
+    list_parser.add_argument("--logs", action="store_true", help="Also show log paths")
+
+    new_parser = subparsers.add_parser("new", help="Submit a new JupyterLab job")
+    new_parser.add_argument("--preset", help="Preset id")
+    new_parser.add_argument("--job-name", help="Slurm job name")
+    new_parser.add_argument("--notebook-dir", help="Notebook working directory")
+    new_parser.add_argument("--port", type=int, help="Remote Jupyter port")
+    new_parser.add_argument("--partition", help="Override partition")
+    new_parser.add_argument("--mem", help="Override memory")
+    new_parser.add_argument("--time", help="Override time")
+    new_parser.add_argument("--cpus", type=int, help="Override CPU count")
+    new_parser.add_argument("--gpus", type=int, help="Override GPU count")
+    new_parser.add_argument("--nodelist", help="Override nodelist")
+    new_parser.add_argument("--constraint", help="Override Slurm constraint")
+    new_parser.add_argument("--no-browser", action="store_true", help="Do not open browser after connection")
+
+    connect_parser = subparsers.add_parser("connect", help="Forward a running Jupyter job to localhost")
+    connect_parser.add_argument("job", help="Job id or job name")
+    connect_parser.add_argument("--no-browser", action="store_true")
+
+    watch_parser = subparsers.add_parser("watch", help="Watch a job until it starts or exits")
+    watch_parser.add_argument("job", help="Job id or job name")
+    watch_parser.add_argument("--connect-on-run", action="store_true")
+
+    kill_parser = subparsers.add_parser("kill", help="Kill a job")
+    kill_parser.add_argument("job", help="Job id or job name")
+
+    return parser
+
+
+def make_service(config_path: str | None = None) -> SherlockService:
+    config = load_config(config_path)
+    state = StateStore(config.state_path)
+    return SherlockService(config, state)
+
+
+def build_jobs_table(jobs, *, title: str = "Sherlock Jobs", selected_index: int | None = None):
+    table = Table(title=title)
+    if selected_index is not None:
+        table.add_column("", no_wrap=True, width=2)
+    table.add_column("Job ID", style="cyan", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("State", style="bold")
+    table.add_column("Partition")
+    table.add_column("Reason / Node")
+    table.add_column("Elapsed")
+    table.add_column("Origin")
+    for index, job in enumerate(jobs):
+        row = [
+            job.job_id,
+            job.name,
+            job.state,
+            job.partition,
+            job.reason_or_node,
+            job.elapsed,
+            job.origin,
+        ]
+        style = None
+        if selected_index is not None:
+            row.insert(0, ">" if index == selected_index else "")
+            style = "bold black on cyan" if index == selected_index else None
+        table.add_row(*row, style=style)
+    if not jobs:
+        empty_row = ["-", "No active jobs", "-", "-", "-", "-", "-"]
+        if selected_index is not None:
+            empty_row.insert(0, "")
+        table.add_row(*empty_row)
+    return table
+
+
+def render_jobs_table(jobs, *, title: str = "Sherlock Jobs", selected_index: int | None = None):
+    table = build_jobs_table(jobs, title=title, selected_index=selected_index)
+    console.print(table)
+    return jobs
+
+
+def render_logs(logs: JobLogs) -> None:
+    console.rule("stdout")
+    console.print(logs.stdout or "<empty>")
+    console.rule("stderr")
+    console.print(logs.stderr or "<empty>")
+
+
+def build_action_selector(selected_index: int):
+    text = Text("Actions: ")
+    for index, (key, label) in enumerate(MENU_ACTIONS):
+        if index > 0:
+            text.append("  ")
+        if index == selected_index:
+            text.append(f" {label} ", style="bold black on cyan")
+        else:
+            text.append(f" {label} ", style="white on rgb(60,60,60)")
+        text.append(f" [{key}]", style="dim")
+    help_text = Text("Use left/right arrows, or press the shortcut key, then Enter.", style="dim")
+    return Group(text, help_text)
+
+
+def build_main_menu_view(jobs, selected_index: int):
+    return Group(
+        build_jobs_table(jobs),
+        build_action_selector(selected_index),
+    )
+
+
+def build_job_selector_view(jobs, selected_index: int, *, action_label: str):
+    help_text = Text("Use up/down arrows or j/k, then Enter.", style="dim")
+    return Group(
+        build_jobs_table(jobs, title=f"Select Job To {action_label}", selected_index=selected_index),
+        help_text,
+    )
+
+
+def _read_raw_key() -> str:
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        first = sys.stdin.read(1)
+        if first == "\x03":
+            raise KeyboardInterrupt
+        if first == "\x1b":
+            second = sys.stdin.read(1)
+            third = sys.stdin.read(1)
+            return f"{first}{second}{third}"
+        return first
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def choose_action(jobs) -> str:
+    if not sys.stdin.isatty():
+        render_jobs_table(jobs)
+        return Prompt.ask("Choose action", choices=[key for key, _label in MENU_ACTIONS], default="r").lower()
+
+    selected_index = 0
+    with Live(build_main_menu_view(jobs, selected_index), console=console, auto_refresh=False) as live:
+        while True:
+            key = _read_raw_key()
+            if key == "\x1b[C":
+                selected_index = (selected_index + 1) % len(MENU_ACTIONS)
+                live.update(build_main_menu_view(jobs, selected_index), refresh=True)
+            elif key == "\x1b[D":
+                selected_index = (selected_index - 1) % len(MENU_ACTIONS)
+                live.update(build_main_menu_view(jobs, selected_index), refresh=True)
+            elif key in {"\r", "\n"}:
+                return MENU_ACTIONS[selected_index][0]
+            else:
+                lowered = key.lower()
+                for index, (shortcut, _label) in enumerate(MENU_ACTIONS):
+                    if lowered == shortcut:
+                        return shortcut
+                if lowered == "h":
+                    selected_index = (selected_index - 1) % len(MENU_ACTIONS)
+                    live.update(build_main_menu_view(jobs, selected_index), refresh=True)
+
+
+def choose_job(jobs, *, action_label: str):
+    if not jobs:
+        raise SherlockError(f"No jobs available for {action_label.lower()}.")
+    if not sys.stdin.isatty():
+        render_jobs_table(jobs, title=f"Select Job To {action_label}")
+        choices = [job.job_id for job in jobs]
+        job_id = Prompt.ask("Job id", choices=choices, default=choices[0])
+        return next(job for job in jobs if job.job_id == job_id)
+
+    selected_index = 0
+    with Live(
+        build_job_selector_view(jobs, selected_index, action_label=action_label),
+        console=console,
+        auto_refresh=False,
+    ) as live:
+        while True:
+            key = _read_raw_key()
+            if key == "\x1b[B" or key.lower() == "j":
+                selected_index = (selected_index + 1) % len(jobs)
+                live.update(build_job_selector_view(jobs, selected_index, action_label=action_label), refresh=True)
+            elif key == "\x1b[A" or key.lower() == "k":
+                selected_index = (selected_index - 1) % len(jobs)
+                live.update(build_job_selector_view(jobs, selected_index, action_label=action_label), refresh=True)
+            elif key in {"\r", "\n"}:
+                return jobs[selected_index]
+
+
+def select_preset(service: SherlockService) -> Preset:
+    presets = list(service.config.presets.values())
+    table = Table(title="Available Presets")
+    table.add_column("#", style="cyan", no_wrap=True)
+    table.add_column("Preset")
+    table.add_column("Partition")
+    table.add_column("Resources")
+    table.add_column("Default Port")
+    for idx, preset in enumerate(presets, start=1):
+        resources = f"{preset.cpus} CPU"
+        if preset.gpus:
+            resources += f", {preset.gpus} GPU"
+        table.add_row(str(idx), f"{preset.id} ({preset.label})", preset.partition, resources, str(preset.port))
+    console.print(table)
+    choice = IntPrompt.ask("Select preset", default=1)
+    if choice < 1 or choice > len(presets):
+        raise SherlockError("Invalid preset selection.")
+    return presets[choice - 1]
+
+
+def build_submission_request(service: SherlockService, args) -> SubmissionRequest:
+    preset = service.config.presets.get(args.preset) if getattr(args, "preset", None) else None
+    if preset is None:
+        preset = select_preset(service)
+
+    job_name = getattr(args, "job_name", None) or Prompt.ask("Job name", default=preset.job_name)
+    notebook_dir = getattr(args, "notebook_dir", None) or Prompt.ask(
+        "Notebook dir",
+        default=preset.notebook_dir or service.config.connection.default_notebook_dir,
+    )
+
+    request = SubmissionRequest(
+        preset=preset,
+        job_name=job_name,
+        notebook_dir=notebook_dir,
+        port=getattr(args, "port", None) or preset.port,
+        partition=getattr(args, "partition", None) or preset.partition,
+        mem=getattr(args, "mem", None) or preset.mem,
+        time=getattr(args, "time", None) or preset.time,
+        cpus=getattr(args, "cpus", None) or preset.cpus,
+        gpus=getattr(args, "gpus", None) if getattr(args, "gpus", None) is not None else preset.gpus,
+        nodelist=getattr(args, "nodelist", None) or preset.nodelist,
+        constraint=getattr(args, "constraint", None) or preset.constraint,
+        gres_flags=preset.gres_flags,
+        gpu_cmode=preset.gpu_cmode,
+        isolated_compute_node=preset.isolated_compute_node,
+    )
+
+    if not getattr(args, "preset", None) and Confirm.ask("Edit advanced resource settings?", default=False):
+        request = replace(
+            request,
+            port=IntPrompt.ask("Port", default=request.port),
+            partition=Prompt.ask("Partition", default=request.partition),
+            mem=Prompt.ask("Memory", default=request.mem),
+            time=Prompt.ask("Time", default=request.time),
+            cpus=IntPrompt.ask("CPUs", default=request.cpus),
+            gpus=IntPrompt.ask("GPUs", default=request.gpus),
+            nodelist=Prompt.ask("Nodelist", default=request.nodelist or ""),
+            constraint=Prompt.ask("Constraint", default=request.constraint or ""),
+        )
+        request = replace(
+            request,
+            nodelist=request.nodelist or None,
+            constraint=request.constraint or None,
+        )
+    return request
+
+
+def run_new(service: SherlockService, args) -> int:
+    request = build_submission_request(service, args)
+    job_id = service.submit_job(request)
+    console.print(f"Submitted [cyan]{job_id}[/cyan] as [bold]{request.job_name}[/bold].")
+    status = service.watch_job(job_id, connect_on_run=False, console=console)
+    if status:
+        console.print(f"Final watch state: [bold]{status.state}[/bold]")
+    if status and status.state == "RUNNING":
+        jupyter = service.connect_job(job_id, open_browser=not args.no_browser)
+        console.print(f"Forwarded to [green]{jupyter.local_url}[/green]")
+    return 0
+
+
+def interactive_menu(service: SherlockService) -> int:
+    interrupt_tracker = InterruptTracker()
+    while True:
+        try:
+            jobs = service.list_jobs()
+            action = choose_action(jobs)
+            should_pause = action not in {"r", "refresh", "q", "quit"}
+            if action in {"q", "quit"}:
+                return 0
+            if action in {"r", "refresh"}:
+                continue
+            if action in {"n", "new"}:
+                args = argparse.Namespace(
+                    preset=None,
+                    job_name=None,
+                    notebook_dir=None,
+                    port=None,
+                    partition=None,
+                    mem=None,
+                    time=None,
+                    cpus=None,
+                    gpus=None,
+                    nodelist=None,
+                    constraint=None,
+                    no_browser=False,
+                )
+                run_new(service, args)
+            elif action in {"c", "connect"}:
+                running_jobs = [job for job in jobs if job.state == "RUNNING"]
+                target = choose_job(running_jobs, action_label="Connect")
+                info = service.connect_job(target.job_id, open_browser=True)
+                console.print(f"Forwarded to [green]{info.local_url}[/green]")
+            elif action in {"w", "watch"}:
+                target = choose_job(jobs, action_label="Watch")
+                status = service.watch_job(target.job_id, console=console)
+                console.print(f"Watch finished with [bold]{status.state}[/bold]")
+            elif action in {"k", "kill"}:
+                target = choose_job(jobs, action_label="Kill")
+                job_id = service.kill_job(target.job_id)
+                console.print(f"Killed [cyan]{job_id}[/cyan]")
+            elif action in {"l", "logs"}:
+                target = choose_job(jobs, action_label="View Logs")
+                render_logs(service.get_job_logs(target.job_id))
+            else:
+                console.print("[red]Unknown action.[/red]")
+        except SherlockError as exc:
+            console.print(f"[red]{exc}[/red]")
+            should_pause = True
+        except KeyboardInterrupt:
+            console.print()
+            if should_exit_on_interrupt(interrupt_tracker):
+                console.print("[yellow]Exiting on second Ctrl+C.[/yellow]")
+                return 130
+            console.print("[yellow]Press Ctrl+C again within 2 seconds to exit.[/yellow]")
+            should_pause = False
+
+        if should_pause:
+            Prompt.ask("Press Enter to continue", default="")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    service = make_service(args.config)
+
+    try:
+        if args.command is None:
+            return interactive_menu(service)
+        if args.command == "list":
+            jobs = service.list_jobs()
+            render_jobs_table(jobs)
+            if args.logs:
+                for job in jobs:
+                    detail = service.get_job_detail(job.job_id)
+                    console.print(
+                        f"{job.job_id} stdout={detail.stdout_path or '-'} stderr={detail.stderr_path or '-'}"
+                    )
+            return 0
+        if args.command == "new":
+            return run_new(service, args)
+        if args.command == "connect":
+            info = service.connect_job(args.job, open_browser=not args.no_browser)
+            console.print(f"Forwarded to [green]{info.local_url}[/green]")
+            return 0
+        if args.command == "watch":
+            status = service.watch_job(args.job, connect_on_run=args.connect_on_run, console=console)
+            console.print(f"{status.job_id} {status.name} {status.state}")
+            return 0
+        if args.command == "kill":
+            job_id = service.kill_job(args.job)
+            console.print(f"Killed [cyan]{job_id}[/cyan]")
+            return 0
+    except SherlockError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 1
+    except KeyboardInterrupt:
+        console.print()
+        console.print("[yellow]Interrupted.[/yellow]")
+        return 130
+    return 0
