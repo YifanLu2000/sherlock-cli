@@ -1,10 +1,11 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 import unittest
 
 from sherlock_cli.config import load_config
 from sherlock_cli.models import SubmissionRequest
-from sherlock_cli.service import SherlockService
+from sherlock_cli.service import SherlockError, SherlockService
 from sherlock_cli.state import StateStore
 
 
@@ -129,10 +130,16 @@ class ServiceTests(unittest.TestCase):
 
             jobs = service.list_jobs()
             self.assertEqual(len(jobs), 2)
-            info = service.connect_job("4321", open_browser=False)
+            self.assertFalse(jobs[0].connected)
+            with mock.patch.object(service, "_port_available", return_value=True):
+                info = service.connect_job("4321", open_browser=False)
             self.assertIsInstance(info.local_port, int)
             self.assertGreater(info.local_port, 0)
             self.assertEqual(info.local_url, f"http://localhost:{info.local_port}/lab?token=abc123")
+            with mock.patch.object(service, "_pid_alive", return_value=True):
+                refreshed_jobs = service.list_jobs()
+            connected_job = next(job for job in refreshed_jobs if job.job_id == "4321")
+            self.assertTrue(connected_job.connected)
             self.assertEqual(len(session_factory.sessions), 1)
             session = session_factory.sessions[0]
             commands = [command for command, _check in session.commands]
@@ -150,6 +157,26 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(session.closed)
             service.list_jobs()
             self.assertEqual(len(session_factory.sessions), 2)
+
+    def test_connect_job_errors_when_local_port_is_busy(self):
+        with TemporaryDirectory() as tmpdir:
+            service, _session_factory = self.make_service(tmpdir)
+            service.state.record_submission(
+                job_id="4321",
+                job_name="GPU-jupyterlab",
+                preset_id="xiaojie-gpu",
+                notebook_dir="/oak/demo",
+                remote_port=56793,
+                remote_stdout="/home/demo/forward-util/GPU-jupyterlab-4321.out",
+                remote_stderr="/home/demo/forward-util/GPU-jupyterlab-4321.err",
+                remote_template="/home/demo/forward-util/GPU-jupyterlab.sbatch",
+            )
+
+            with mock.patch.object(service, "_port_available", return_value=False):
+                with self.assertRaises(SherlockError) as ctx:
+                    service.connect_job("4321", open_browser=False)
+
+            self.assertEqual(str(ctx.exception), "Local port 56793 is already in use.")
 
     def test_kill_job_clears_tunnel(self):
         with TemporaryDirectory() as tmpdir:
@@ -169,6 +196,27 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(job_id, "4321")
             metadata = service.state.get("4321")
             self.assertIsNone(metadata.tunnel_pid)
+
+
+    def test_connect_external_job_adopts_into_state(self):
+        with TemporaryDirectory() as tmpdir:
+            service, _session_factory = self.make_service(tmpdir)
+            # No record_submission — job 4321 is "external"
+            self.assertIsNone(service.state.get("4321"))
+
+            with mock.patch.object(service, "_port_available", return_value=True):
+                info = service.connect_job("4321", open_browser=False)
+
+            self.assertIsInstance(info.local_port, int)
+            self.assertIn("token=abc123", info.local_url)
+
+            # External job should now be adopted into state with tunnel info
+            metadata = service.state.get("4321")
+            self.assertIsNotNone(metadata)
+            self.assertEqual(metadata.job_name, "GPU-jupyterlab")
+            self.assertEqual(metadata.remote_port, 56793)
+            self.assertEqual(metadata.tunnel_pid, 7777)
+            self.assertEqual(metadata.preset_id, "")
 
 
 if __name__ == "__main__":

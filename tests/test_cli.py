@@ -1,7 +1,10 @@
 from unittest import mock
 import unittest
 
-from sherlock_cli.cli import InterruptTracker, _read_raw_key, should_exit_on_interrupt
+from rich.text import Text
+
+from sherlock_cli.cli import InterruptTracker, _read_raw_key, build_jobs_table, should_exit_on_interrupt
+from sherlock_cli.models import JobInfo
 
 
 class CliTests(unittest.TestCase):
@@ -31,6 +34,35 @@ class CliTests(unittest.TestCase):
         ):
             with self.assertRaises(KeyboardInterrupt):
                 _read_raw_key()
+
+    def test_build_jobs_table_marks_connected_jobs(self):
+        jobs = [
+            JobInfo(
+                job_id="123",
+                name="GPU-jupyterlab",
+                state="RUNNING",
+                partition="gpu",
+                reason_or_node="sh03-01",
+                elapsed="01:23",
+                origin="CLI-managed",
+                connected=True,
+            )
+        ]
+
+        table = build_jobs_table(jobs)
+
+        name_cell = table.columns[1]._cells[0]
+        state_cell = table.columns[2]._cells[0]
+        origin_cell = table.columns[6]._cells[0]
+        self.assertIsInstance(name_cell, Text)
+        self.assertEqual(name_cell.plain, "● GPU-jupyterlab")
+        self.assertEqual(str(name_cell.style), "bold green")
+        self.assertIsInstance(state_cell, Text)
+        self.assertEqual(state_cell.plain, "RUNNING")
+        self.assertEqual(str(state_cell.style), "bold green")
+        self.assertIsInstance(origin_cell, Text)
+        self.assertEqual(origin_cell.plain, "CLI-managed, connected")
+        self.assertEqual(str(origin_cell.style), "bold green")
 
 
 if __name__ == "__main__":

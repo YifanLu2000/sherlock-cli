@@ -60,6 +60,7 @@ class JobInfo:
     reason_or_node: str
     elapsed: str
     origin: str
+    connected: bool = False
 
 
 @dataclass

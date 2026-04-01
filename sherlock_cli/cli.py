@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import select
 import sys
 import termios
 import time
@@ -11,6 +12,7 @@ from dataclasses import replace
 from rich.console import Console, Group
 from rich.live import Live
 from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.spinner import Spinner
 from rich.text import Text
 from rich.table import Table
 
@@ -107,14 +109,21 @@ def build_jobs_table(jobs, *, title: str = "Sherlock Jobs", selected_index: int 
     table.add_column("Elapsed")
     table.add_column("Origin")
     for index, job in enumerate(jobs):
+        name_cell = Text(job.name)
+        state_cell = Text(job.state)
+        origin_cell = Text(job.origin)
+        if job.connected:
+            name_cell = Text(f"● {job.name}", style="bold green")
+            state_cell = Text(job.state, style="bold green")
+            origin_cell = Text(f"{job.origin}, connected", style="bold green")
         row = [
             job.job_id,
-            job.name,
-            job.state,
+            name_cell,
+            state_cell,
             job.partition,
             job.reason_or_node,
             job.elapsed,
-            job.origin,
+            origin_cell,
         ]
         style = None
         if selected_index is not None:
@@ -171,11 +180,15 @@ def build_job_selector_view(jobs, selected_index: int, *, action_label: str):
     )
 
 
-def _read_raw_key() -> str:
+def _read_raw_key(*, timeout: float | None = None) -> str | None:
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
+        if timeout is not None:
+            ready, _, _ = select.select([fd], [], [], timeout)
+            if not ready:
+                return None
         first = sys.stdin.read(1)
         if first == "\x03":
             raise KeyboardInterrupt
@@ -188,7 +201,10 @@ def _read_raw_key() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def choose_action(jobs) -> str:
+AUTO_REFRESH_SECONDS = 10.0
+
+
+def choose_action(jobs, *, refresh_callback=None) -> str:
     if not sys.stdin.isatty():
         render_jobs_table(jobs)
         return Prompt.ask("Choose action", choices=[key for key, _label in MENU_ACTIONS], default="r").lower()
@@ -196,7 +212,12 @@ def choose_action(jobs) -> str:
     selected_index = 0
     with Live(build_main_menu_view(jobs, selected_index), console=console, auto_refresh=False) as live:
         while True:
-            key = _read_raw_key()
+            key = _read_raw_key(timeout=AUTO_REFRESH_SECONDS)
+            if key is None:
+                if refresh_callback:
+                    jobs = refresh_callback()
+                    live.update(build_main_menu_view(jobs, selected_index), refresh=True)
+                continue
             if key == "\x1b[C":
                 selected_index = (selected_index + 1) % len(MENU_ACTIONS)
                 live.update(build_main_menu_view(jobs, selected_index), refresh=True)
@@ -242,24 +263,60 @@ def choose_job(jobs, *, action_label: str):
                 return jobs[selected_index]
 
 
-def select_preset(service: SherlockService) -> Preset:
-    presets = list(service.config.presets.values())
-    table = Table(title="Available Presets")
-    table.add_column("#", style="cyan", no_wrap=True)
-    table.add_column("Preset")
+def build_preset_table(presets: list[Preset], *, selected_index: int | None = None) -> Table:
+    table = Table(title="Select Preset")
+    if selected_index is not None:
+        table.add_column("", no_wrap=True, width=2)
+    table.add_column("Preset", style="cyan")
     table.add_column("Partition")
     table.add_column("Resources")
     table.add_column("Default Port")
-    for idx, preset in enumerate(presets, start=1):
+    for idx, preset in enumerate(presets):
         resources = f"{preset.cpus} CPU"
         if preset.gpus:
             resources += f", {preset.gpus} GPU"
-        table.add_row(str(idx), f"{preset.id} ({preset.label})", preset.partition, resources, str(preset.port))
-    console.print(table)
-    choice = IntPrompt.ask("Select preset", default=1)
-    if choice < 1 or choice > len(presets):
-        raise SherlockError("Invalid preset selection.")
-    return presets[choice - 1]
+        row = [f"{preset.id} ({preset.label})", preset.partition, resources, str(preset.port)]
+        style = None
+        if selected_index is not None:
+            row.insert(0, ">" if idx == selected_index else "")
+            style = "bold black on cyan" if idx == selected_index else None
+        table.add_row(*row, style=style)
+    return table
+
+
+def build_preset_selector_view(presets: list[Preset], selected_index: int):
+    help_text = Text("Use up/down arrows or j/k, then Enter.", style="dim")
+    return Group(build_preset_table(presets, selected_index=selected_index), help_text)
+
+
+def select_preset(service: SherlockService) -> Preset:
+    presets = list(service.config.presets.values())
+    if not presets:
+        raise SherlockError("No presets configured.")
+
+    if not sys.stdin.isatty():
+        console.print(build_preset_table(presets))
+        choice = IntPrompt.ask("Select preset (number)", default=1)
+        if choice < 1 or choice > len(presets):
+            raise SherlockError("Invalid preset selection.")
+        return presets[choice - 1]
+
+    selected_index = 0
+    with Live(
+        build_preset_selector_view(presets, selected_index),
+        console=console,
+        auto_refresh=False,
+    ) as live:
+        while True:
+            key = _read_raw_key()
+            if key == "\x1b[B" or key.lower() == "j":
+                selected_index = (selected_index + 1) % len(presets)
+                live.update(build_preset_selector_view(presets, selected_index), refresh=True)
+            elif key == "\x1b[A" or key.lower() == "k":
+                selected_index = (selected_index - 1) % len(presets)
+                live.update(build_preset_selector_view(presets, selected_index), refresh=True)
+            elif key in {"\r", "\n"}:
+                return presets[selected_index]
 
 
 def build_submission_request(service: SherlockService, args) -> SubmissionRequest:
@@ -323,12 +380,57 @@ def run_new(service: SherlockService, args) -> int:
     return 0
 
 
+LOGO = """\
+[bold cyan]\
+   ___  _         _           _
+  / _ \\(_)_   _  | |    __ _| |__
+ | | | | | | | | | |   / _` | '_ \\
+ | |_| | | |_| | | |__| (_| | |_) |
+  \\__\\_\\_|\\__,_| |_____\\__,_|_.__/
+  ____
+ / ___|  ___ _ ____   _____ _ __
+ \\___ \\ / _ \\ '__\\ \\ / / _ \\ '__|
+  ___) |  __/ |   \\ V /  __/ |
+ |____/ \\___|_|    \\_/ \\___|_|[/bold cyan]
+"""
+
+
+def show_splash_and_load(service: SherlockService) -> list:
+    import threading
+
+    result = []
+    error = []
+
+    def fetch():
+        try:
+            result.extend(service.list_jobs())
+        except Exception as exc:
+            error.append(exc)
+
+    thread = threading.Thread(target=fetch, daemon=True)
+    thread.start()
+
+    spinner = Spinner("dots", text="[dim]Connecting to Sherlock...[/dim]")
+    splash = Group(Text.from_markup(LOGO), spinner)
+    with Live(splash, console=console, auto_refresh=True, refresh_per_second=10):
+        thread.join()
+
+    if error:
+        raise error[0]
+    return result
+
+
 def interactive_menu(service: SherlockService) -> int:
     interrupt_tracker = InterruptTracker()
+    first_load = True
     while True:
         try:
-            jobs = service.list_jobs()
-            action = choose_action(jobs)
+            if first_load:
+                jobs = show_splash_and_load(service)
+                first_load = False
+            else:
+                jobs = service.list_jobs()
+            action = choose_action(jobs, refresh_callback=service.list_jobs)
             should_pause = action not in {"r", "refresh", "q", "quit"}
             if action in {"q", "quit"}:
                 return 0
@@ -349,7 +451,10 @@ def interactive_menu(service: SherlockService) -> int:
                     constraint=None,
                     no_browser=False,
                 )
-                run_new(service, args)
+                request = build_submission_request(service, args)
+                job_id = service.submit_job(request)
+                console.print(f"Submitted [cyan]{job_id}[/cyan] as [bold]{request.job_name}[/bold].")
+                should_pause = False
             elif action in {"c", "connect"}:
                 running_jobs = [job for job in jobs if job.state == "RUNNING"]
                 target = choose_job(running_jobs, action_label="Connect")

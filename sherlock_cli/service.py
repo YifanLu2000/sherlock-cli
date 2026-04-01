@@ -13,7 +13,7 @@ import uuid
 import webbrowser
 from pathlib import Path
 
-from .models import AppConfig, JobDetail, JobInfo, JobLogs, JupyterInfo, SubmissionRequest
+from .models import AppConfig, JobDetail, JobInfo, JobLogs, JobMetadata, JupyterInfo, SubmissionRequest
 from .parsing import (
     parse_job_detail,
     parse_jupyter_info,
@@ -22,7 +22,7 @@ from .parsing import (
     parse_squeue_jobs,
     rewrite_local_jupyter_url,
 )
-from .state import StateStore
+from .state import StateStore, utc_now
 
 
 class SherlockError(RuntimeError):
@@ -237,6 +237,7 @@ class SherlockService:
         self._ssh_session = None
 
     def list_jobs(self) -> list[JobInfo]:
+        connected_job_ids = self._connected_job_ids()
         output = self._ssh_output(
             self._remote_bash(
                 "squeue -u {user} --states=PENDING,RUNNING -o '%i|%j|%T|%P|%R|%M' -h".format(
@@ -245,6 +246,8 @@ class SherlockService:
             )
         )
         jobs = parse_squeue_jobs(output, self.state.managed_job_ids())
+        for job in jobs:
+            job.connected = job.job_id in connected_job_ids
         jobs.sort(key=lambda job: (job.state != "RUNNING", job.job_id))
         return jobs
 
@@ -268,11 +271,14 @@ class SherlockService:
         return detail
 
     def get_job_status(self, job_id: str) -> JobInfo | None:
+        connected_job_ids = self._connected_job_ids()
         queue_output = self._ssh_output(
             self._remote_bash(f"squeue -j {shlex.quote(job_id)} -o '%i|%j|%T|%P|%R|%M' -h")
         )
         if queue_output.strip():
-            return parse_squeue_jobs(queue_output, self.state.managed_job_ids())[0]
+            status = parse_squeue_jobs(queue_output, self.state.managed_job_ids())[0]
+            status.connected = status.job_id in connected_job_ids
+            return status
         history_output = self._ssh_output(
             self._remote_bash(
                 "sacct -j {job_id} --format=JobIDRaw,JobName,State,Partition,NodeList,Elapsed -P -n".format(
@@ -280,7 +286,10 @@ class SherlockService:
                 )
             )
         )
-        return parse_sacct_job(history_output, self.state.managed_job_ids())
+        status = parse_sacct_job(history_output, self.state.managed_job_ids())
+        if status:
+            status.connected = status.job_id in connected_job_ids
+        return status
 
     def submit_job(self, request: SubmissionRequest) -> str:
         remote_util_dir = self.remote_util_dir
@@ -373,12 +382,15 @@ class SherlockService:
         metadata = self.state.get(job_id)
         remote_port = metadata.remote_port if metadata else None
         jupyter = self.wait_for_jupyter(job_id, fallback_port=remote_port)
-        local_port = self._choose_local_port(jupyter.port)
         existing = metadata.tunnel_pid if metadata else None
         if existing and self._pid_alive(existing):
             jupyter.local_port = metadata.local_port
             jupyter.local_url = metadata.jupyter_url
             return jupyter
+        local_port = self._choose_local_port(jupyter.port)
+
+        if not metadata:
+            metadata = self._adopt_external_job(job_id, detail, jupyter.port)
 
         tunnel = self._start_tunnel(
             node=detail.node_list,
@@ -456,6 +468,20 @@ class SherlockService:
             self._remote_home = self._ssh_output(self._remote_bash("printf '%s' \"$HOME\"")).strip()
         return self._remote_home
 
+    def _adopt_external_job(self, job_id: str, detail: JobDetail, remote_port: int) -> JobMetadata:
+        metadata = JobMetadata(
+            job_id=job_id,
+            job_name=detail.name,
+            preset_id="",
+            notebook_dir="",
+            remote_port=remote_port,
+            remote_stdout=detail.stdout_path or "",
+            remote_stderr=detail.stderr_path or "",
+            remote_template="",
+            created_at=utc_now(),
+        )
+        return self.state.upsert(metadata)
+
     def _job_is_isolated(self, metadata, detail: JobDetail | None = None) -> bool:
         if metadata is None:
             if detail:
@@ -468,6 +494,13 @@ class SherlockService:
 
     def _read_remote_file(self, path: str, lines: int) -> str:
         return self._ssh_output(self._remote_bash(f"tail -n {int(lines)} {shlex.quote(path)}"), check=False)
+
+    def _connected_job_ids(self) -> set[str]:
+        connected: set[str] = set()
+        for job_id, metadata in self.state.jobs.items():
+            if metadata.tunnel_pid and self._pid_alive(metadata.tunnel_pid):
+                connected.add(job_id)
+        return connected
 
     def _upload_text_file(self, local_path: Path, remote_path: str) -> None:
         self._ssh_session_or_create().write_text(remote_path, local_path.read_text())
@@ -507,9 +540,7 @@ class SherlockService:
     def _choose_local_port(self, preferred: int) -> int:
         if self._port_available(preferred):
             return preferred
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            return int(sock.getsockname()[1])
+        raise SherlockError(f"Local port {preferred} is already in use.")
 
     @staticmethod
     def _port_available(port: int) -> bool:
