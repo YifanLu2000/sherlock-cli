@@ -484,11 +484,33 @@ def choose_cluster(clusters: list[tuple[str, object]]) -> tuple[str, object] | N
                 return None
 
 
+def _tail_last_line(path) -> str:
+    """Return the last non-empty line of a file, or empty string."""
+    try:
+        with open(path) as fh:
+            lines = fh.readlines()
+        for line in reversed(lines):
+            stripped = line.strip()
+            if stripped:
+                return stripped
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
 def show_splash_and_load(service: SherlockService) -> list:
     import threading
 
     result = []
     error = []
+
+    # Truncate old log so we only see fresh output for this connection attempt.
+    log_path = service.ssh_log_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        log_path.write_text("")
+    except OSError:
+        pass
 
     def fetch():
         try:
@@ -499,10 +521,21 @@ def show_splash_and_load(service: SherlockService) -> list:
     thread = threading.Thread(target=fetch, daemon=True)
     thread.start()
 
-    spinner = Spinner("dots", text=f"[dim]Connecting to {cluster_name(service)}...[/dim]")
-    splash = Group(Text.from_markup(LOGO), spinner)
-    with Live(splash, console=console, auto_refresh=True, refresh_per_second=10):
-        thread.join()
+    def build_splash():
+        last_log = _tail_last_line(log_path)
+        log_line = Text(f"  {last_log}", style="dim") if last_log else Text("")
+        log_hint = Text(f"  Log: {log_path}", style="dim italic")
+        return Group(
+            Text.from_markup(LOGO),
+            Spinner("dots", text=f"[dim]Connecting to {cluster_name(service)}...[/dim]"),
+            log_line,
+            log_hint,
+        )
+
+    with Live(build_splash(), console=console, auto_refresh=True, refresh_per_second=4) as live:
+        while thread.is_alive():
+            thread.join(timeout=0.25)
+            live.update(build_splash())
 
     if error:
         raise error[0]

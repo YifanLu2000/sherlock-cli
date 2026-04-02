@@ -40,12 +40,15 @@ class PersistentSSHSession:
         *,
         command: list[str] | None = None,
         popen_factory=None,
+        log_path: Path | str | None = None,
     ):
         if command is None and resource is None:
             raise ValueError("resource or command is required")
         self.command = command or ["ssh", resource, "bash", "-l"]
         self.popen_factory = popen_factory or subprocess.Popen
+        self.log_path = Path(log_path) if log_path else None
         self._process = None
+        self._log_file = None
         self._stdout_queue: queue.Queue[str | None] = queue.Queue()
         self._lock = threading.Lock()
         atexit.register(self.close)
@@ -97,6 +100,12 @@ class PersistentSSHSession:
                 stream.close()
             except OSError:
                 pass
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
 
     def _run_once(self, command: str, *, check: bool) -> str:
         with self._lock:
@@ -132,11 +141,16 @@ class PersistentSSHSession:
         if self._process is not None and self._process.poll() is None:
             return self._process
         self.close()
+        stderr_target = None
+        if self.log_path:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_file = open(self.log_path, "a")
+            stderr_target = self._log_file
         process = self.popen_factory(
             self.command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=stderr_target,
             text=True,
             bufsize=1,
         )
@@ -560,10 +574,15 @@ class SherlockService:
         )
         return args
 
+    @property
+    def ssh_log_path(self) -> Path:
+        name = self.config.connection.name.lower().replace(" ", "-")
+        return self.config.state_path.parent / f"ssh-{name}.log"
+
     def _build_ssh_session(self) -> PersistentSSHSession:
         command = self._login_ssh_args()
         command.extend(["bash", "-l"])
-        return PersistentSSHSession(command=command)
+        return PersistentSSHSession(command=command, log_path=self.ssh_log_path)
 
     def _ssh_session_or_create(self):
         if self._ssh_session is None:
