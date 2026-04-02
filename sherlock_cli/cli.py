@@ -178,7 +178,7 @@ def build_main_menu_view(jobs, selected_index: int):
 
 
 def build_job_selector_view(jobs, selected_index: int, *, action_label: str):
-    help_text = Text("Use up/down arrows or j/k, then Enter.", style="dim")
+    help_text = Text("Use up/down arrows or j/k, Enter to select, Esc to go back.", style="dim")
     return Group(
         build_jobs_table(jobs, title=f"Select Job To {action_label}", selected_index=selected_index),
         help_text,
@@ -198,7 +198,13 @@ def _read_raw_key(*, timeout: float | None = None) -> str | None:
         if first == "\x03":
             raise KeyboardInterrupt
         if first == "\x1b":
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                return ESC_KEY
             second = sys.stdin.read(1)
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                return f"{first}{second}"
             third = sys.stdin.read(1)
             return f"{first}{second}{third}"
         return first
@@ -207,6 +213,7 @@ def _read_raw_key(*, timeout: float | None = None) -> str | None:
 
 
 AUTO_REFRESH_SECONDS = 10.0
+ESC_KEY = "\x1b"
 
 
 def choose_action(jobs, *, refresh_callback=None) -> str:
@@ -264,6 +271,8 @@ def choose_job(jobs, *, action_label: str):
             elif key == "\x1b[A" or key.lower() == "k":
                 selected_index = (selected_index - 1) % len(jobs)
                 live.update(build_job_selector_view(jobs, selected_index, action_label=action_label), refresh=True)
+            elif key == ESC_KEY:
+                return None
             elif key in {"\r", "\n"}:
                 return jobs[selected_index]
 
@@ -290,11 +299,11 @@ def build_preset_table(presets: list[Preset], *, selected_index: int | None = No
 
 
 def build_preset_selector_view(presets: list[Preset], selected_index: int):
-    help_text = Text("Use up/down arrows or j/k, then Enter.", style="dim")
+    help_text = Text("Use up/down arrows or j/k, Enter to select, Esc to go back.", style="dim")
     return Group(build_preset_table(presets, selected_index=selected_index), help_text)
 
 
-def select_preset(service: SherlockService) -> Preset:
+def select_preset(service: SherlockService) -> Preset | None:
     presets = list(service.config.presets.values())
     if not presets:
         raise SherlockError("No presets configured.")
@@ -320,14 +329,18 @@ def select_preset(service: SherlockService) -> Preset:
             elif key == "\x1b[A" or key.lower() == "k":
                 selected_index = (selected_index - 1) % len(presets)
                 live.update(build_preset_selector_view(presets, selected_index), refresh=True)
+            elif key == ESC_KEY:
+                return None
             elif key in {"\r", "\n"}:
                 return presets[selected_index]
 
 
-def build_submission_request(service: SherlockService, args) -> SubmissionRequest:
+def build_submission_request(service: SherlockService, args) -> SubmissionRequest | None:
     preset = service.config.presets.get(args.preset) if getattr(args, "preset", None) else None
     if preset is None:
         preset = select_preset(service)
+        if preset is None:
+            return None
 
     job_name = getattr(args, "job_name", None) or Prompt.ask("Job name", default=preset.job_name)
     notebook_dir = getattr(args, "notebook_dir", None) or Prompt.ask(
@@ -377,6 +390,8 @@ def build_submission_request(service: SherlockService, args) -> SubmissionReques
 
 def run_new(service: SherlockService, args) -> int:
     request = build_submission_request(service, args)
+    if request is None:
+        return 0
     job_id = service.submit_job(request)
     console.print(f"Submitted [cyan]{job_id}[/cyan] as [bold]{request.job_name}[/bold].")
     status = service.watch_job(job_id, connect_on_run=False, console=console)
@@ -461,24 +476,39 @@ def interactive_menu(service: SherlockService) -> int:
                     no_browser=False,
                 )
                 request = build_submission_request(service, args)
+                if request is None:
+                    should_pause = False
+                    continue
                 job_id = service.submit_job(request)
                 console.print(f"Submitted [cyan]{job_id}[/cyan] as [bold]{request.job_name}[/bold].")
                 should_pause = False
             elif action in {"c", "connect"}:
                 running_jobs = [job for job in jobs if job.state == "RUNNING"]
                 target = choose_job(running_jobs, action_label="Connect")
+                if target is None:
+                    should_pause = False
+                    continue
                 info = service.connect_job(target.job_id, open_browser=True)
                 console.print(f"Forwarded to [green]{info.local_url}[/green]")
             elif action in {"w", "watch"}:
                 target = choose_job(jobs, action_label="Watch")
+                if target is None:
+                    should_pause = False
+                    continue
                 status = service.watch_job(target.job_id, console=console)
                 console.print(f"Watch finished with [bold]{status.state}[/bold]")
             elif action in {"k", "kill"}:
                 target = choose_job(jobs, action_label="Kill")
+                if target is None:
+                    should_pause = False
+                    continue
                 job_id = service.kill_job(target.job_id)
                 console.print(f"Killed [cyan]{job_id}[/cyan]")
             elif action in {"l", "logs"}:
                 target = choose_job(jobs, action_label="View Logs")
+                if target is None:
+                    should_pause = False
+                    continue
                 render_logs(service.get_job_logs(target.job_id))
             else:
                 console.print("[red]Unknown action.[/red]")
