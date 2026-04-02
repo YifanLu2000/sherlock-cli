@@ -1,0 +1,31 @@
+[connection]
+name = "Marlowe"
+resource = "marlowe"
+domain_name = "login.marlowe.stanford.edu"
+forward_username = "luyifan"
+email = "luyifan@stanford.edu"
+machine_prefix = "ml"
+default_notebook_dir = "/projects/m000134/LuYifan"
+remote_util_dir = "~/forward-util"
+use_kerberos = false
+
+[state]
+path = "~/.local/state/sherlock-cli/marlowe-state.json"
+
+[watch]
+poll_interval_seconds = 5
+startup_timeout_seconds = 300
+
+[[presets]]
+id = "marlowe-batch-gpu"
+label = "Marlowe Batch GPU"
+job_name = "marlowe-GPU-jupyterlab"
+sbatch_script = "sbatches/Marlowe-GPU-jupyterlab.sbatch"
+partition = "batch"
+account = "marlowe-m000134-pm05"
+cpus = 8
+gpus = 1
+mem = "64G"
+time = "02:00:00"
+port = 56810
+isolated_compute_node = false

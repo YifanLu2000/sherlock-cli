@@ -29,6 +29,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
 
     connection_raw = raw["connection"]
     connection = ConnectionConfig(
+        name=connection_raw.get("name", connection_raw["resource"]),
         resource=connection_raw["resource"],
         domain_name=connection_raw["domain_name"],
         forward_username=connection_raw["forward_username"],
@@ -51,6 +52,7 @@ def load_config(config_path: str | None = None) -> AppConfig:
             mem=item["mem"],
             time=item["time"],
             port=int(item["port"]),
+            account=item.get("account"),
             gpus=int(item.get("gpus", 0)),
             nodelist=item.get("nodelist"),
             constraint=item.get("constraint"),

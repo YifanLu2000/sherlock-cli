@@ -10,6 +10,7 @@ class ConfigTests(unittest.TestCase):
         config = load_config()
         self.assertIn("xiaojie-cpu", config.presets)
         self.assertEqual(config.presets["general-cpu"].partition, "normal")
+        self.assertEqual(config.connection.name, "Sherlock")
         self.assertEqual(config.connection.resource, "sherlock")
 
     def test_custom_config_path(self):
@@ -18,6 +19,7 @@ class ConfigTests(unittest.TestCase):
             config_path.write_text(
                 """
 [connection]
+name = "Demo"
 resource = "demo"
 domain_name = "login.demo"
 forward_username = "user"
@@ -39,11 +41,14 @@ cpus = 2
 mem = "4G"
 time = "01:00:00"
 port = 9999
+account = "demo-account"
 """
             )
             config = load_config(str(config_path))
+            self.assertEqual(config.connection.name, "Demo")
             self.assertEqual(config.connection.resource, "demo")
             self.assertEqual(config.presets["demo"].port, 9999)
+            self.assertEqual(config.presets["demo"].account, "demo-account")
 
 
 if __name__ == "__main__":

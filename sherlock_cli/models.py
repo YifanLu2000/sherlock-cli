@@ -6,6 +6,7 @@ from pathlib import Path
 
 @dataclass
 class ConnectionConfig:
+    name: str
     resource: str
     domain_name: str
     forward_username: str
@@ -27,6 +28,7 @@ class Preset:
     mem: str
     time: str
     port: int
+    account: str | None = None
     gpus: int = 0
     nodelist: str | None = None
     constraint: str | None = None
@@ -98,6 +100,7 @@ class SubmissionRequest:
     mem: str
     time: str
     cpus: int
+    account: str | None
     gpus: int
     nodelist: str | None
     constraint: str | None

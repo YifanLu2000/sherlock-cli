@@ -55,8 +55,8 @@ def should_exit_on_interrupt(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sherlock-cli", description="Manage Sherlock Jupyter jobs")
-    parser.add_argument("--config", help="Path to sherlock_presets.toml")
+    parser = argparse.ArgumentParser(prog="sherlock-cli", description="Manage Slurm Jupyter jobs")
+    parser.add_argument("--config", help="Path to a cluster config TOML")
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -69,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     new_parser.add_argument("--notebook-dir", help="Notebook working directory")
     new_parser.add_argument("--port", type=int, help="Remote Jupyter port")
     new_parser.add_argument("--partition", help="Override partition")
+    new_parser.add_argument("--account", help="Override Slurm account")
     new_parser.add_argument("--mem", help="Override memory")
     new_parser.add_argument("--time", help="Override time")
     new_parser.add_argument("--cpus", type=int, help="Override CPU count")
@@ -97,7 +98,11 @@ def make_service(config_path: str | None = None) -> SherlockService:
     return SherlockService(config, state)
 
 
-def build_jobs_table(jobs, *, title: str = "Sherlock Jobs", selected_index: int | None = None):
+def cluster_name(service: SherlockService) -> str:
+    return service.config.connection.name
+
+
+def build_jobs_table(jobs, *, title: str = "Jobs", selected_index: int | None = None):
     table = Table(title=title)
     if selected_index is not None:
         table.add_column("", no_wrap=True, width=2)
@@ -138,7 +143,7 @@ def build_jobs_table(jobs, *, title: str = "Sherlock Jobs", selected_index: int 
     return table
 
 
-def render_jobs_table(jobs, *, title: str = "Sherlock Jobs", selected_index: int | None = None):
+def render_jobs_table(jobs, *, title: str = "Jobs", selected_index: int | None = None):
     table = build_jobs_table(jobs, title=title, selected_index=selected_index)
     console.print(table)
     return jobs
@@ -339,6 +344,7 @@ def build_submission_request(service: SherlockService, args) -> SubmissionReques
         mem=getattr(args, "mem", None) or preset.mem,
         time=getattr(args, "time", None) or preset.time,
         cpus=getattr(args, "cpus", None) or preset.cpus,
+        account=getattr(args, "account", None) or preset.account,
         gpus=getattr(args, "gpus", None) if getattr(args, "gpus", None) is not None else preset.gpus,
         nodelist=getattr(args, "nodelist", None) or preset.nodelist,
         constraint=getattr(args, "constraint", None) or preset.constraint,
@@ -352,6 +358,7 @@ def build_submission_request(service: SherlockService, args) -> SubmissionReques
             request,
             port=IntPrompt.ask("Port", default=request.port),
             partition=Prompt.ask("Partition", default=request.partition),
+            account=Prompt.ask("Account", default=request.account or ""),
             mem=Prompt.ask("Memory", default=request.mem),
             time=Prompt.ask("Time", default=request.time),
             cpus=IntPrompt.ask("CPUs", default=request.cpus),
@@ -361,6 +368,7 @@ def build_submission_request(service: SherlockService, args) -> SubmissionReques
         )
         request = replace(
             request,
+            account=request.account or None,
             nodelist=request.nodelist or None,
             constraint=request.constraint or None,
         )
@@ -410,7 +418,7 @@ def show_splash_and_load(service: SherlockService) -> list:
     thread = threading.Thread(target=fetch, daemon=True)
     thread.start()
 
-    spinner = Spinner("dots", text="[dim]Connecting to Sherlock...[/dim]")
+    spinner = Spinner("dots", text=f"[dim]Connecting to {cluster_name(service)}...[/dim]")
     splash = Group(Text.from_markup(LOGO), spinner)
     with Live(splash, console=console, auto_refresh=True, refresh_per_second=10):
         thread.join()
@@ -443,6 +451,7 @@ def interactive_menu(service: SherlockService) -> int:
                     notebook_dir=None,
                     port=None,
                     partition=None,
+                    account=None,
                     mem=None,
                     time=None,
                     cpus=None,
@@ -498,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
             return interactive_menu(service)
         if args.command == "list":
             jobs = service.list_jobs()
-            render_jobs_table(jobs)
+            render_jobs_table(jobs, title=f"{cluster_name(service)} Jobs")
             if args.logs:
                 for job in jobs:
                     detail = service.get_job_detail(job.job_id)

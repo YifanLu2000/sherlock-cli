@@ -324,6 +324,8 @@ class SherlockService:
             "--mail-user",
             self.config.connection.email,
         ]
+        if request.account:
+            sbatch_args.extend(["-A", request.account])
         if request.nodelist:
             sbatch_args.extend(["--nodelist", request.nodelist])
         if request.constraint:
@@ -509,26 +511,20 @@ class SherlockService:
         if not node:
             raise SherlockError("Job does not have an assigned node yet.")
         if isolated_compute_node:
-            args = [
-                "ssh",
-                "-L",
-                f"{local_port}:localhost:{remote_port}",
-                self.config.connection.resource,
-                "ssh",
-                "-L",
-                f"{remote_port}:localhost:{remote_port}",
-                "-N",
-                node,
-            ]
+            args = self._login_ssh_args()
+            args.extend(
+                [
+                    "-L",
+                    f"{local_port}:localhost:{remote_port}",
+                    "ssh",
+                    "-L",
+                    f"{remote_port}:localhost:{remote_port}",
+                    "-N",
+                    node,
+                ]
+            )
         else:
-            args = [
-                "ssh",
-                self.config.connection.domain_name,
-                "-l",
-                self.config.connection.forward_username,
-            ]
-            if self.config.connection.use_kerberos:
-                args.append("-K")
+            args = self._login_ssh_args()
             args.extend(["-L", f"{local_port}:{node}:{remote_port}", "-N"])
         return self.popen_factory(
             args,
@@ -572,8 +568,23 @@ class SherlockService:
     def _shell_join(args: list[str]) -> str:
         return " ".join(shlex.quote(arg) for arg in args)
 
+    def _login_ssh_args(self) -> list[str]:
+        args = ["ssh"]
+        if self.config.connection.use_kerberos:
+            args.append("-K")
+        args.extend(
+            [
+                "-l",
+                self.config.connection.forward_username,
+                self.config.connection.domain_name,
+            ]
+        )
+        return args
+
     def _build_ssh_session(self) -> PersistentSSHSession:
-        return PersistentSSHSession(self.config.connection.resource)
+        command = self._login_ssh_args()
+        command.extend(["bash", "-l"])
+        return PersistentSSHSession(command=command)
 
     def _ssh_session_or_create(self):
         if self._ssh_session is None:

@@ -96,6 +96,7 @@ class ServiceTests(unittest.TestCase):
                 mem=preset.mem,
                 time=preset.time,
                 cpus=preset.cpus,
+                account=preset.account,
                 gpus=preset.gpus,
                 nodelist=preset.nodelist,
                 constraint=preset.constraint,
@@ -113,6 +114,35 @@ class ServiceTests(unittest.TestCase):
             remote_path, content = session.uploads[0]
             self.assertTrue(remote_path.endswith("/GPU-jupyterlab.sbatch"))
             self.assertIn("#!/bin/bash", content)
+            self.assertTrue(any("sbatch --parsable" in command for command, _check in session.commands))
+            self.assertFalse(any(" -A " in command for command, _check in session.commands))
+
+    def test_submit_job_includes_account_when_configured(self):
+        with TemporaryDirectory() as tmpdir:
+            service, session_factory = self.make_service(tmpdir)
+            preset = service.config.presets["xiaojie-gpu"]
+            request = SubmissionRequest(
+                preset=preset,
+                job_name=preset.job_name,
+                notebook_dir="/oak/demo",
+                port=preset.port,
+                partition=preset.partition,
+                mem=preset.mem,
+                time=preset.time,
+                cpus=preset.cpus,
+                account="demo-account",
+                gpus=preset.gpus,
+                nodelist=preset.nodelist,
+                constraint=preset.constraint,
+                gres_flags=preset.gres_flags,
+                gpu_cmode=preset.gpu_cmode,
+                isolated_compute_node=preset.isolated_compute_node,
+            )
+            service.submit_job(request)
+
+            session = session_factory.sessions[0]
+            submit_command = next(command for command, _check in session.commands if "sbatch --parsable" in command)
+            self.assertIn(" -A demo-account ", submit_command)
 
     def test_list_and_connect_job_reuses_single_session(self):
         with TemporaryDirectory() as tmpdir:
