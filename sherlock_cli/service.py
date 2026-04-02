@@ -585,8 +585,13 @@ class SherlockService:
         return PersistentSSHSession(command=command, log_path=self.ssh_log_path)
 
     def ensure_connected(self) -> None:
-        """Establish the SSH session, allowing interactive auth (password/2FA)."""
-        self._ssh_session_or_create()
+        """Establish the SSH session, allowing interactive auth (password/2FA).
+
+        Runs a trivial command to force SSH to complete authentication
+        before returning.  This keeps auth prompts visible on the terminal
+        (outside of Rich Live).
+        """
+        self._ssh_output(self._remote_bash("echo __sherlock_connected__"))
 
     def _ssh_session_or_create(self):
         if self._ssh_session is None:
