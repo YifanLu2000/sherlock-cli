@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import select
 import sys
 import termios
@@ -194,7 +195,11 @@ def _read_raw_key(*, timeout: float | None = None) -> str | None:
             ready, _, _ = select.select([fd], [], [], timeout)
             if not ready:
                 return None
-        first = sys.stdin.read(1)
+        # Use os.read instead of sys.stdin.read to bypass Python's internal
+        # buffering.  sys.stdin.read(1) may pull all available bytes from the
+        # kernel fd into its buffer, leaving select() unable to see the
+        # remaining bytes of an escape sequence (it checks the kernel fd).
+        first = os.read(fd, 1).decode()
         if first == "\x03":
             raise KeyboardInterrupt
         if first == "\x1b":
@@ -202,14 +207,14 @@ def _read_raw_key(*, timeout: float | None = None) -> str | None:
             if not ready:
                 return ESC_KEY
 
-            second = sys.stdin.read(1)
+            second = os.read(fd, 1).decode()
             if second not in {"[", "O"}:
                 return f"{first}{second}"
 
             sequence = [first, second]
             ready, _, _ = select.select([fd], [], [], 0.1)
             while ready and len(sequence) < 8:
-                sequence.append(sys.stdin.read(1))
+                sequence.append(os.read(fd, 1).decode())
                 # Arrow keys and similar terminal controls often arrive as ESC [ X or ESC O X.
                 # Once we have the final alphabetic byte, stop instead of leaking it into the next read.
                 if sequence[-1].isalpha() or sequence[-1] == "~":
@@ -245,23 +250,9 @@ def choose_action(jobs, *, refresh_callback=None) -> str:
             elif key == "\x1b[D":
                 selected_index = (selected_index - 1) % len(MENU_ACTIONS)
                 live.update(build_main_menu_view(jobs, selected_index), refresh=True)
-            elif key in ("\x1b[A", "\x1b[B"):
-                # Up/down arrows not used in main menu — ignore silently
-                pass
-            elif key == ESC_KEY:
-                # Drain any trailing escape sequence fragments that arrived
-                # after ESC due to SSH latency (prevents e.g. "[" + "C" from
-                # being read as separate keystrokes where "C" triggers Connect)
-                while True:
-                    extra = _read_raw_key(timeout=0.05)
-                    if extra is None:
-                        break
-            elif key.startswith("\x1b"):
-                # Unknown escape sequence — ignore silently
-                pass
             elif key in {"\r", "\n"}:
                 return MENU_ACTIONS[selected_index][0]
-            elif len(key) == 1 and key.isalpha():
+            else:
                 lowered = key.lower()
                 for index, (shortcut, _label) in enumerate(MENU_ACTIONS):
                     if lowered == shortcut:

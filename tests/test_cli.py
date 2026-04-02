@@ -47,9 +47,9 @@ class CliTests(unittest.TestCase):
     def test_raw_ctrl_c_raises_keyboard_interrupt(self):
         fake_stdin = mock.Mock()
         fake_stdin.fileno.return_value = 0
-        fake_stdin.read.return_value = "\x03"
         with (
             mock.patch("sherlock_cli.cli.sys.stdin", fake_stdin),
+            mock.patch("sherlock_cli.cli.os.read", return_value=b"\x03"),
             mock.patch("sherlock_cli.cli.termios.tcgetattr", return_value=object()),
             mock.patch("sherlock_cli.cli.termios.tcsetattr"),
             mock.patch("sherlock_cli.cli.tty.setraw"),
@@ -60,9 +60,9 @@ class CliTests(unittest.TestCase):
     def test_raw_escape_returns_escape_key(self):
         fake_stdin = mock.Mock()
         fake_stdin.fileno.return_value = 0
-        fake_stdin.read.return_value = ESC_KEY
         with (
             mock.patch("sherlock_cli.cli.sys.stdin", fake_stdin),
+            mock.patch("sherlock_cli.cli.os.read", return_value=b"\x1b"),
             mock.patch("sherlock_cli.cli.select.select", side_effect=[([0], [], []), ([], [], [])]),
             mock.patch("sherlock_cli.cli.termios.tcgetattr", return_value=object()),
             mock.patch("sherlock_cli.cli.termios.tcsetattr"),
@@ -73,9 +73,12 @@ class CliTests(unittest.TestCase):
     def test_raw_arrow_key_returns_full_escape_sequence(self):
         fake_stdin = mock.Mock()
         fake_stdin.fileno.return_value = 0
-        fake_stdin.read.side_effect = [ESC_KEY, "[", "C"]
         with (
             mock.patch("sherlock_cli.cli.sys.stdin", fake_stdin),
+            mock.patch(
+                "sherlock_cli.cli.os.read",
+                side_effect=[b"\x1b", b"[", b"C"],
+            ),
             mock.patch(
                 "sherlock_cli.cli.select.select",
                 side_effect=[([0], [], []), ([0], [], []), ([0], [], []), ([], [], [])],
