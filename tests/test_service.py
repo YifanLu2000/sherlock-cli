@@ -12,9 +12,11 @@ from sherlock_cli.state import StateStore
 class FakeRunner:
     def __init__(self):
         self.calls = []
+        self.kwargs = []
 
-    def __call__(self, args, capture_output=True, text=True):
+    def __call__(self, args, stdout=None, stderr=None, text=True):
         self.calls.append(args)
+        self.kwargs.append({"stdout": stdout, "stderr": stderr, "text": text})
         command = " ".join(args)
         if "printf '%s' \"$HOME\"" in command:
             return SimpleNamespace(returncode=0, stdout="/home/demo", stderr="")
@@ -127,6 +129,13 @@ class ServiceTests(unittest.TestCase):
             self.assertIsInstance(info.local_port, int)
             self.assertGreater(info.local_port, 0)
             self.assertEqual(info.local_url, f"http://localhost:{info.local_port}/lab?token=abc123")
+
+    def test_ssh_stderr_is_not_captured(self):
+        with TemporaryDirectory() as tmpdir:
+            service, runner = self.make_service(tmpdir)
+            service.list_jobs()
+            self.assertTrue(runner.kwargs)
+            self.assertIsNone(runner.kwargs[0]["stderr"])
 
     def test_kill_job_clears_tunnel(self):
         with TemporaryDirectory() as tmpdir:

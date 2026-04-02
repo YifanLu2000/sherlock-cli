@@ -361,9 +361,10 @@ class SherlockService:
         ]
 
     def _run(self, args: list[str], *, check: bool = True):
-        result = self.runner(args, capture_output=True, text=True)
+        result = self.runner(args, stdout=subprocess.PIPE, stderr=None, text=True)
         if check and result.returncode != 0:
-            raise SherlockError(result.stderr.strip() or result.stdout.strip() or f"Command failed: {args}")
+            stdout = (result.stdout or "").strip()
+            raise SherlockError(stdout or f"Command failed: {args}")
         return result
 
     def _ssh_output(self, args: list[str], *, check: bool = True) -> str:
