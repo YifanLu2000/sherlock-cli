@@ -563,15 +563,20 @@ class SherlockService:
 
     def _login_ssh_args(self) -> list[str]:
         args = ["ssh"]
-        if self.config.connection.use_kerberos:
-            args.append("-K")
-        args.extend(
-            [
-                "-l",
-                self.config.connection.forward_username,
-                self.config.connection.domain_name,
-            ]
-        )
+        if self.config.connection.ssh_host:
+            # Use the SSH config alias (e.g. "marlowe") so that the user's
+            # ~/.ssh/config options (GSSAPI, ControlMaster, etc.) apply.
+            args.append(self.config.connection.ssh_host)
+        else:
+            if self.config.connection.use_kerberos:
+                args.append("-K")
+            args.extend(
+                [
+                    "-l",
+                    self.config.connection.forward_username,
+                    self.config.connection.domain_name,
+                ]
+            )
         return args
 
     @property
@@ -589,8 +594,13 @@ class SherlockService:
 
         Runs a trivial command to force SSH to complete authentication
         before returning.  This keeps auth prompts visible on the terminal
-        (outside of Rich Live).
+        (outside of Rich Live).  Also runs shell_init if configured (e.g.
+        ``module load slurm`` on clusters where SLURM isn't on the default
+        PATH).
         """
+        init = self.config.connection.shell_init
+        if init:
+            self._ssh_output(self._remote_bash(init), check=False)
         self._ssh_output(self._remote_bash("echo __sherlock_connected__"))
 
     def _ssh_session_or_create(self):

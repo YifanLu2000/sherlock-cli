@@ -50,6 +50,8 @@ def load_config(config_path: str | None = None) -> AppConfig:
         default_notebook_dir=connection_raw["default_notebook_dir"],
         remote_util_dir=connection_raw["remote_util_dir"],
         use_kerberos=connection_raw.get("use_kerberos", True),
+        ssh_host=connection_raw.get("ssh_host"),
+        shell_init=connection_raw.get("shell_init"),
     )
 
     presets: dict[str, Preset] = {}

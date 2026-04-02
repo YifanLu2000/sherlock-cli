@@ -15,6 +15,8 @@ class ConnectionConfig:
     default_notebook_dir: str
     remote_util_dir: str
     use_kerberos: bool = True
+    ssh_host: str | None = None
+    shell_init: str | None = None
 
 
 @dataclass
