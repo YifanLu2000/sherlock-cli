@@ -7,7 +7,7 @@ email = "luyifan@stanford.edu"
 machine_prefix = "ml"
 default_notebook_dir = "/projects/m000134/LuYifan"
 remote_util_dir = "~/forward-util"
-use_kerberos = false
+use_kerberos = true
 
 [state]
 path = "~/.local/state/sherlock-cli/marlowe-state.json"
