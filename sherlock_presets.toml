@@ -16,6 +16,42 @@ path = "~/.local/state/sherlock-cli/state.json"
 poll_interval_seconds = 5
 startup_timeout_seconds = 300
 
+[remote]
+login_alias = "sherlock"
+login_host = "login.sherlock.stanford.edu"
+compute_host_alias = "sherlock-compute"
+workspace_dir = "~/.cursor-remote/sherlock"
+
+[[remote_profiles]]
+id = "cpu"
+label = "Sherlock Remote CPU"
+job_name = "cursor-cpu"
+partition = "xiaojie"
+cpus = 10
+mem = "100GB"
+time = "48:00:00"
+default = true
+
+[[remote_profiles]]
+id = "gpu"
+label = "Sherlock Remote GPU"
+job_name = "cursor-gpu"
+partition = "xiaojie"
+cpus = 15
+gpus = 2
+mem = "200GB"
+time = "120:00:00"
+gpu_cmode = "shared"
+
+[[remote_profiles]]
+id = "owners"
+label = "Sherlock Remote Owners"
+job_name = "cursor-owners"
+partition = "owners"
+cpus = 8
+mem = "700GB"
+time = "08:00:00"
+
 [[presets]]
 id = "xiaojie-cpu"
 label = "Xiaojie CPU"

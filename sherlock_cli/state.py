@@ -5,7 +5,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import JobMetadata, StateData
+from .models import JobMetadata, RemoteSessionMetadata, StateData
 
 
 def utc_now() -> str:
@@ -26,10 +26,15 @@ class StateStore:
             job_id: JobMetadata(**payload)
             for job_id, payload in raw.get("jobs", {}).items()
         }
-        return StateData(jobs=jobs)
+        remote_payload = raw.get("remote_session")
+        remote_session = RemoteSessionMetadata(**remote_payload) if remote_payload else None
+        return StateData(jobs=jobs, remote_session=remote_session)
 
     def save(self) -> None:
-        payload = {"jobs": {job_id: asdict(metadata) for job_id, metadata in self._data.jobs.items()}}
+        payload = {
+            "jobs": {job_id: asdict(metadata) for job_id, metadata in self._data.jobs.items()},
+            "remote_session": asdict(self._data.remote_session) if self._data.remote_session else None,
+        }
         self.path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
     @property
@@ -46,6 +51,18 @@ class StateStore:
         self._data.jobs[metadata.job_id] = metadata
         self.save()
         return metadata
+
+    def get_remote_session(self) -> RemoteSessionMetadata | None:
+        return self._data.remote_session
+
+    def set_remote_session(self, session: RemoteSessionMetadata) -> RemoteSessionMetadata:
+        self._data.remote_session = session
+        self.save()
+        return session
+
+    def clear_remote_session(self) -> None:
+        self._data.remote_session = None
+        self.save()
 
     def update_tunnel(
         self,

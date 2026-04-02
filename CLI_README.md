@@ -1,11 +1,21 @@
 # Sherlock CLI
 
-`sherlock-cli` is a Python CLI for submitting and managing Slurm-backed JupyterLab jobs on configured clusters such as Sherlock and Marlowe.
+`sherlock-cli` is a Python CLI for two related workflows on clusters such as Sherlock and Marlowe:
+
+- Slurm-backed JupyterLab jobs
+- Cursor/VS Code/SSH remote sessions on compute nodes
 
 ## Install
 
 ```bash
 python3 -m pip install -e .
+```
+
+You can also use the thin installer:
+
+```bash
+./install.sh sherlock
+./install.sh marlowe
 ```
 
 After installation, the command is:
@@ -30,6 +40,10 @@ sherlock-cli --config marlowe_presets.toml
 - Opens the forwarded Jupyter URL in your browser
 - Kills a job and cleans up its local SSH tunnel if the CLI created one
 - Reads remote stdout and stderr logs for a selected job
+- Sets up login-node SSH config and remote `sshd` assets for compute-node access
+- Attaches a user-mode `sshd` to an existing running job
+- Starts dedicated remote session jobs from configured remote profiles
+- Installs compatibility entrypoints: `sherlock-compute` and `marlowe-compute`
 
 ## Interactive Mode
 
@@ -183,6 +197,105 @@ sherlock-cli kill 123456
 
 If the CLI created a local SSH tunnel for that job, it also terminates the local tunnel process.
 
+### `sherlock-cli remote setup --full`
+
+Prepare both local SSH config and remote compute-node access files.
+
+```bash
+sherlock-cli remote setup --full
+```
+
+This command:
+
+- checks for a local SSH public key
+- ensures a login-node SSH alias exists
+- uploads `start_sshd.sh`
+- creates remote `sshd_config` and host keys
+- writes configured remote start profiles such as `cpu`, `gpu`, or `owners`
+
+If you only want the remote cluster-side assets, use:
+
+```bash
+sherlock-cli remote setup
+```
+
+If you only want the local SSH alias, use:
+
+```bash
+sherlock-cli remote setup-local
+```
+
+### `sherlock-cli remote attach [job]`
+
+Attach a compute-node remote session to an existing running job.
+
+```bash
+sherlock-cli remote attach 123456
+```
+
+If no job id is provided, the CLI prompts you to choose from current `RUNNING` jobs.
+
+### `sherlock-cli remote start [profile]`
+
+Start a dedicated remote session job from a configured remote profile.
+
+```bash
+sherlock-cli remote start gpu
+```
+
+Sherlock ships `cpu`, `gpu`, and `owners`. Marlowe does not ship default remote start profiles; use `attach` unless you add your own `[[remote_profiles]]` entries.
+
+### `sherlock-cli remote connect`
+
+Reconnect to the current remote session by refreshing the local SSH config for the compute node.
+
+```bash
+sherlock-cli remote connect
+```
+
+### `sherlock-cli remote list`
+
+Show current cluster jobs together with remote session metadata.
+
+```bash
+sherlock-cli remote list
+```
+
+### `sherlock-cli remote stop`
+
+Stop the current remote session.
+
+```bash
+sherlock-cli remote stop
+```
+
+Behavior depends on session type:
+
+- attached sessions stop only the user-mode `sshd`
+- dedicated sessions cancel the dedicated Slurm job
+
+### `sherlock-cli remote clean`
+
+Remove the local compute-node SSH block from `~/.ssh/config`.
+
+```bash
+sherlock-cli remote clean
+```
+
+## Compatibility Commands
+
+The package also installs these wrapper commands:
+
+```bash
+sherlock-compute ...
+marlowe-compute ...
+```
+
+They forward to:
+
+- `sherlock-cli --config sherlock_presets.toml remote ...`
+- `sherlock-cli --config marlowe_presets.toml remote ...`
+
 ## Presets
 
 The repo currently ships with `sherlock_presets.toml` and `marlowe_presets.toml`.
@@ -231,9 +344,12 @@ The config controls:
 - email
 - default notebook directory
 - remote utility directory
+- remote SSH aliases and workspace directory
+- remote setup shell init
 - watch polling interval
 - startup timeout
 - all preset definitions
+- all remote profile definitions
 
 The Marlowe preset uses `batch`, `gpu:1`, `time=02:00:00`, and `account=marlowe-m000134-pm05`, matching the equivalent `srun` allocation you provided.
 
@@ -258,6 +374,14 @@ This is used to:
 - label jobs as `CLI-managed`
 - reconnect more reliably
 - clean up local tunnels on `kill`
+
+The state file also stores the most recently verified remote session metadata for the configured cluster:
+
+- job id
+- compute node
+- compute port
+- session type
+- verification timestamp
 
 ## Typical Workflow
 

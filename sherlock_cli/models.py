@@ -20,6 +20,16 @@ class ConnectionConfig:
 
 
 @dataclass
+class RemoteConfig:
+    login_alias: str = ""
+    login_host: str = ""
+    compute_host_alias: str = ""
+    workspace_dir: str = ""
+    shell_init: str | None = None
+    home_template: str = "/home/users/{user}"
+
+
+@dataclass
 class Preset:
     id: str
     label: str
@@ -45,12 +55,33 @@ class Preset:
 
 
 @dataclass
+class RemoteProfile:
+    id: str
+    job_name: str
+    partition: str
+    cpus: int
+    mem: str
+    time: str
+    label: str | None = None
+    account: str | None = None
+    gpus: int = 0
+    nodelist: str | None = None
+    constraint: str | None = None
+    gres_flags: str | None = None
+    gpu_cmode: str | None = None
+    default: bool = False
+
+
+@dataclass
 class AppConfig:
     repo_root: Path
     config_path: Path
     connection: ConnectionConfig
     presets: dict[str, Preset]
     state_path: Path
+    remote: RemoteConfig = field(default_factory=RemoteConfig)
+    remote_profiles: dict[str, RemoteProfile] = field(default_factory=dict)
+    remote_default_profile_id: str | None = None
     poll_interval_seconds: int = 5
     startup_timeout_seconds: int = 300
 
@@ -118,6 +149,15 @@ class JobLogs:
 
 
 @dataclass
+class RemoteSessionMetadata:
+    job_id: str
+    node: str
+    port: int
+    session_type: str
+    last_verified_at: str
+
+
+@dataclass
 class JobDetail:
     job_id: str
     name: str
@@ -133,3 +173,4 @@ class JobDetail:
 @dataclass
 class StateData:
     jobs: dict[str, JobMetadata] = field(default_factory=dict)
+    remote_session: RemoteSessionMetadata | None = None

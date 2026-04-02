@@ -8,7 +8,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
-from .models import AppConfig, ConnectionConfig, Preset
+from .models import AppConfig, ConnectionConfig, Preset, RemoteConfig, RemoteProfile
 
 
 def _repo_root() -> Path:
@@ -53,6 +53,15 @@ def load_config(config_path: str | None = None) -> AppConfig:
         ssh_host=connection_raw.get("ssh_host"),
         shell_init=connection_raw.get("shell_init"),
     )
+    remote_raw = raw.get("remote", {})
+    remote = RemoteConfig(
+        login_alias=remote_raw.get("login_alias", connection.ssh_host or connection.resource),
+        login_host=remote_raw.get("login_host", connection.domain_name),
+        compute_host_alias=remote_raw.get("compute_host_alias", f"{connection.resource}-compute"),
+        workspace_dir=remote_raw.get("workspace_dir", f"~/.cursor-remote/{connection.resource}"),
+        shell_init=remote_raw.get("shell_init", connection.shell_init),
+        home_template=remote_raw.get("home_template", "/home/users/{user}"),
+    )
 
     presets: dict[str, Preset] = {}
     for item in raw.get("presets", []):
@@ -77,6 +86,29 @@ def load_config(config_path: str | None = None) -> AppConfig:
         )
         presets[preset.id] = preset
 
+    remote_profiles: dict[str, RemoteProfile] = {}
+    remote_default_profile_id: str | None = None
+    for item in raw.get("remote_profiles", []):
+        profile = RemoteProfile(
+            id=item["id"],
+            label=item.get("label"),
+            job_name=item["job_name"],
+            partition=item["partition"],
+            cpus=int(item["cpus"]),
+            mem=item["mem"],
+            time=item["time"],
+            account=item.get("account"),
+            gpus=int(item.get("gpus", 0)),
+            nodelist=item.get("nodelist"),
+            constraint=item.get("constraint"),
+            gres_flags=item.get("gres_flags"),
+            gpu_cmode=item.get("gpu_cmode"),
+            default=bool(item.get("default", False)),
+        )
+        remote_profiles[profile.id] = profile
+        if profile.default and remote_default_profile_id is None:
+            remote_default_profile_id = profile.id
+
     state_path = _expand_path(raw.get("state", {}).get("path", "~/.local/state/sherlock-cli/state.json"))
 
     return AppConfig(
@@ -85,6 +117,9 @@ def load_config(config_path: str | None = None) -> AppConfig:
         connection=connection,
         presets=presets,
         state_path=state_path,
+        remote=remote,
+        remote_profiles=remote_profiles,
+        remote_default_profile_id=remote_default_profile_id,
         poll_interval_seconds=int(raw.get("watch", {}).get("poll_interval_seconds", 5)),
         startup_timeout_seconds=int(raw.get("watch", {}).get("startup_timeout_seconds", 300)),
     )

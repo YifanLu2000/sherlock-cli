@@ -18,6 +18,13 @@ path = "~/.local/state/sherlock-cli/marlowe-state.json"
 poll_interval_seconds = 5
 startup_timeout_seconds = 300
 
+[remote]
+login_alias = "marlowe"
+login_host = "login.marlowe.stanford.edu"
+compute_host_alias = "marlowe-compute"
+workspace_dir = "~/.cursor-remote/marlowe"
+shell_init = "source /etc/profile >/dev/null 2>&1 || true; module load slurm >/dev/null 2>&1 || true"
+
 [[presets]]
 id = "marlowe-batch-gpu"
 label = "Marlowe Batch GPU"

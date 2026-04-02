@@ -19,6 +19,7 @@ from rich.table import Table
 
 from .config import discover_configs, load_config
 from .models import JobLogs, Preset, SubmissionRequest
+from .remote import RemoteService
 from .service import SherlockError, SherlockService
 from .state import StateStore
 
@@ -91,6 +92,26 @@ def build_parser() -> argparse.ArgumentParser:
     kill_parser = subparsers.add_parser("kill", help="Kill a job")
     kill_parser.add_argument("job", help="Job id or job name")
 
+    remote_parser = subparsers.add_parser("remote", help="Manage Cursor/SSH remote sessions")
+    remote_subparsers = remote_parser.add_subparsers(dest="remote_command")
+    remote_subparsers.required = True
+
+    remote_setup_parser = remote_subparsers.add_parser("setup", help="Set up remote session files on the cluster")
+    remote_setup_parser.add_argument("--full", action="store_true", help="Also set up local SSH config")
+
+    remote_subparsers.add_parser("setup-local", help="Set up local SSH config only")
+
+    remote_attach_parser = remote_subparsers.add_parser("attach", help="Attach remote sshd to a running job")
+    remote_attach_parser.add_argument("job", nargs="?", help="Running job id or job name")
+
+    remote_start_parser = remote_subparsers.add_parser("start", help="Start a dedicated remote job")
+    remote_start_parser.add_argument("profile", nargs="?", help="Remote profile id")
+
+    remote_subparsers.add_parser("connect", help="Reconnect to an existing remote session")
+    remote_subparsers.add_parser("list", help="List jobs and remote session status")
+    remote_subparsers.add_parser("stop", help="Stop the current remote session")
+    remote_subparsers.add_parser("clean", help="Remove the local compute-node SSH config block")
+
     return parser
 
 
@@ -98,6 +119,12 @@ def make_service(config_path: str | None = None) -> SherlockService:
     config = load_config(config_path)
     state = StateStore(config.state_path)
     return SherlockService(config, state)
+
+
+def make_remote_service(config_path: str | None = None) -> RemoteService:
+    config = load_config(config_path)
+    state = StateStore(config.state_path)
+    return RemoteService(config, state)
 
 
 def cluster_name(service: SherlockService) -> str:
@@ -418,6 +445,83 @@ def run_new(service: SherlockService, args) -> int:
     return 0
 
 
+def choose_remote_job(service: RemoteService, target: str | None):
+    if target:
+        job = service.resolve_job(target)
+        if job.state != "RUNNING":
+            raise SherlockError(f"Job {job.job_id} is not RUNNING. Current state: {job.state}")
+        return job.job_id
+    jobs = service.list_running_jobs()
+    if not jobs:
+        raise SherlockError("No RUNNING jobs available for remote attach.")
+    chosen = choose_job(jobs, action_label="Attach Remote")
+    if chosen is None:
+        raise SherlockError("No job selected.")
+    return chosen.job_id
+
+
+def render_remote_session(service: RemoteService, session) -> None:
+    console.print(
+        f"Remote session ready on [cyan]{session.node}:{session.port}[/cyan] "
+        f"(job [cyan]{session.job_id}[/cyan], type [bold]{session.session_type}[/bold])."
+    )
+    console.print(f"Cursor: [green]cursor --remote ssh-remote+{service.compute_host_alias} {service.remote_home}[/green]")
+    console.print(f"SSH: [green]ssh {service.compute_host_alias}[/green]")
+
+
+def run_remote(service: RemoteService, args) -> int:
+    if args.remote_command == "setup-local":
+        key_path = service.setup_local()
+        console.print(f"Local SSH config ready. Using key [green]{key_path}[/green].")
+        return 0
+    if args.remote_command == "setup":
+        if args.full:
+            service.setup_full()
+            console.print(f"Local and remote setup complete for [bold]{cluster_name(service)}[/bold].")
+        else:
+            service.setup_remote()
+            console.print(f"Remote setup complete for [bold]{cluster_name(service)}[/bold].")
+        return 0
+    if args.remote_command == "attach":
+        session = service.attach(choose_remote_job(service, args.job))
+        render_remote_session(service, session)
+        return 0
+    if args.remote_command == "start":
+        session = service.start(args.profile)
+        render_remote_session(service, session)
+        return 0
+    if args.remote_command == "connect":
+        session = service.connect_remote()
+        render_remote_session(service, session)
+        return 0
+    if args.remote_command == "list":
+        jobs = service.list_jobs()
+        render_jobs_table(jobs, title=f"{cluster_name(service)} Jobs")
+        session = service.read_remote_session()
+        if session is None:
+            console.print("[yellow]No remote session found.[/yellow]")
+            return 0
+        status = service.get_job_status(session.job_id)
+        state = status.state if status else "gone"
+        console.print(
+            f"Remote session: job [cyan]{session.job_id}[/cyan] on [cyan]{session.node}:{session.port}[/cyan] "
+            f"([bold]{session.session_type}[/bold], state [bold]{state}[/bold])."
+        )
+        return 0
+    if args.remote_command == "stop":
+        session = service.stop()
+        console.print(
+            f"Stopped remote session for job [cyan]{session.job_id}[/cyan] "
+            f"([bold]{session.session_type}[/bold])."
+        )
+        return 0
+    if args.remote_command == "clean":
+        service.clean()
+        console.print(f"Removed local SSH config for [bold]{service.compute_host_alias}[/bold].")
+        return 0
+    raise SherlockError(f"Unknown remote command: {args.remote_command}")
+
+
 LOGO = """\
 [bold cyan]\
    ___  _         _           _
@@ -618,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Non-interactive subcommands: use a single service (--config or default).
     if args.command is not None:
-        service = make_service(args.config)
+        service = make_remote_service(args.config) if args.command == "remote" else make_service(args.config)
         try:
             if args.command == "list":
                 jobs = service.list_jobs()
@@ -644,6 +748,8 @@ def main(argv: list[str] | None = None) -> int:
                 job_id = service.kill_job(args.job)
                 console.print(f"Killed [cyan]{job_id}[/cyan]")
                 return 0
+            if args.command == "remote":
+                return run_remote(service, args)
         except SherlockError as exc:
             console.print(f"[red]{exc}[/red]")
             return 1

@@ -15,6 +15,8 @@ dependencies = [
 
 [project.scripts]
 sherlock-cli = "sherlock_cli.cli:main"
+sherlock-compute = "sherlock_cli.compat:sherlock_compute_main"
+marlowe-compute = "sherlock_cli.compat:marlowe_compute_main"
 
 [tool.setuptools]
 include-package-data = false
