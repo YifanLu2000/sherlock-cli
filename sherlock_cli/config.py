@@ -19,6 +19,18 @@ def _expand_path(value: str) -> Path:
     return Path(os.path.expanduser(value)).resolve()
 
 
+def discover_configs() -> list[tuple[str, Path]]:
+    """Return ``(cluster_name, config_path)`` for every ``*_presets.toml`` in the repo root."""
+    repo_root = _repo_root()
+    results: list[tuple[str, Path]] = []
+    for path in sorted(repo_root.glob("*_presets.toml")):
+        with path.open("rb") as fh:
+            raw = tomllib.load(fh)
+        name = raw.get("connection", {}).get("name", path.stem)
+        results.append((name, path))
+    return results
+
+
 def load_config(config_path: str | None = None) -> AppConfig:
     repo_root = _repo_root()
     selected_path = Path(

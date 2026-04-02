@@ -6,12 +6,15 @@ from rich.text import Text
 from sherlock_cli.cli import (
     ESC_KEY,
     InterruptTracker,
+    SWITCH_SENTINEL,
     _read_raw_key,
     build_jobs_table,
+    choose_cluster,
     choose_job,
     select_preset,
     should_exit_on_interrupt,
 )
+from sherlock_cli.config import discover_configs
 from sherlock_cli.models import ConnectionConfig, JobInfo, Preset
 
 
@@ -169,6 +172,35 @@ class CliTests(unittest.TestCase):
             mock.patch("sherlock_cli.cli.Live", DummyLive),
         ):
             self.assertIsNone(select_preset(service))
+
+
+    def test_choose_cluster_enter_selects(self):
+        clusters = [("Sherlock", "/tmp/a.toml"), ("Marlowe", "/tmp/b.toml")]
+        with (
+            mock.patch("sherlock_cli.cli.sys.stdin.isatty", return_value=True),
+            mock.patch("sherlock_cli.cli._read_raw_key", return_value="\r"),
+            mock.patch("sherlock_cli.cli.Live", DummyLive),
+        ):
+            result = choose_cluster(clusters)
+            self.assertEqual(result, ("Sherlock", "/tmp/a.toml"))
+
+    def test_choose_cluster_q_returns_none(self):
+        clusters = [("Sherlock", "/tmp/a.toml"), ("Marlowe", "/tmp/b.toml")]
+        with (
+            mock.patch("sherlock_cli.cli.sys.stdin.isatty", return_value=True),
+            mock.patch("sherlock_cli.cli._read_raw_key", return_value="q"),
+            mock.patch("sherlock_cli.cli.Live", DummyLive),
+        ):
+            self.assertIsNone(choose_cluster(clusters))
+
+    def test_discover_configs_finds_toml_files(self):
+        configs = discover_configs()
+        names = [name for name, _path in configs]
+        self.assertIn("Sherlock", names)
+        self.assertIn("Marlowe", names)
+
+    def test_switch_sentinel_is_string(self):
+        self.assertIsInstance(SWITCH_SENTINEL, str)
 
 
 if __name__ == "__main__":

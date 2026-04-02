@@ -17,7 +17,7 @@ from rich.spinner import Spinner
 from rich.text import Text
 from rich.table import Table
 
-from .config import load_config
+from .config import discover_configs, load_config
 from .models import JobLogs, Preset, SubmissionRequest
 from .service import SherlockError, SherlockService
 from .state import StateStore
@@ -31,6 +31,7 @@ MENU_ACTIONS = [
     ("w", "Watch"),
     ("k", "Kill"),
     ("l", "Logs"),
+    ("s", "Switch"),
     ("q", "Quit"),
 ]
 INTERRUPT_EXIT_WINDOW_SECONDS = 2.0
@@ -431,6 +432,57 @@ LOGO = """\
  |____/ \\___|_|    \\_/ \\___|_|[/bold cyan]
 """
 
+SWITCH_SENTINEL = "__switch__"
+
+
+def build_cluster_selector(clusters: list[tuple[str, object]], selected_index: int):
+    text = Text("Select cluster: ")
+    for index, (name, _path) in enumerate(clusters):
+        if index > 0:
+            text.append("  ")
+        if index == selected_index:
+            text.append(f" {name} ", style="bold black on cyan")
+        else:
+            text.append(f" {name} ", style="white on rgb(60,60,60)")
+    help_text = Text("Use left/right arrows, then Enter.", style="dim")
+    return Group(text, help_text)
+
+
+def build_cluster_selection_view(clusters: list[tuple[str, object]], selected_index: int):
+    return Group(
+        Text.from_markup(LOGO),
+        build_cluster_selector(clusters, selected_index),
+    )
+
+
+def choose_cluster(clusters: list[tuple[str, object]]) -> tuple[str, object] | None:
+    if not sys.stdin.isatty():
+        for idx, (name, _path) in enumerate(clusters, 1):
+            console.print(f"  {idx}. {name}")
+        choice = IntPrompt.ask("Select cluster", default=1)
+        if choice < 1 or choice > len(clusters):
+            raise SherlockError("Invalid cluster selection.")
+        return clusters[choice - 1]
+
+    selected_index = 0
+    with Live(
+        build_cluster_selection_view(clusters, selected_index),
+        console=console,
+        auto_refresh=False,
+    ) as live:
+        while True:
+            key = _read_raw_key()
+            if key == "\x1b[C":
+                selected_index = (selected_index + 1) % len(clusters)
+                live.update(build_cluster_selection_view(clusters, selected_index), refresh=True)
+            elif key == "\x1b[D":
+                selected_index = (selected_index - 1) % len(clusters)
+                live.update(build_cluster_selection_view(clusters, selected_index), refresh=True)
+            elif key in {"\r", "\n"}:
+                return clusters[selected_index]
+            elif key.lower() == "q":
+                return None
+
 
 def show_splash_and_load(service: SherlockService) -> list:
     import threading
@@ -457,7 +509,7 @@ def show_splash_and_load(service: SherlockService) -> list:
     return result
 
 
-def interactive_menu(service: SherlockService) -> int:
+def interactive_menu(service: SherlockService) -> int | str:
     interrupt_tracker = InterruptTracker()
     first_load = True
     while True:
@@ -471,6 +523,8 @@ def interactive_menu(service: SherlockService) -> int:
             should_pause = action not in {"r", "refresh", "q", "quit"}
             if action in {"q", "quit"}:
                 return 0
+            if action == SWITCH_SENTINEL:
+                return SWITCH_SENTINEL
             if action in {"r", "refresh"}:
                 continue
             if action in {"n", "new"}:
@@ -524,6 +578,8 @@ def interactive_menu(service: SherlockService) -> int:
                     should_pause = False
                     continue
                 render_logs(service.get_job_logs(target.job_id))
+            elif action in {"s", "switch"}:
+                return SWITCH_SENTINEL
             else:
                 console.print("[red]Unknown action.[/red]")
         except SherlockError as exc:
@@ -544,42 +600,80 @@ def interactive_menu(service: SherlockService) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    service = make_service(args.config)
+
+    # Non-interactive subcommands: use a single service (--config or default).
+    if args.command is not None:
+        service = make_service(args.config)
+        try:
+            if args.command == "list":
+                jobs = service.list_jobs()
+                render_jobs_table(jobs, title=f"{cluster_name(service)} Jobs")
+                if args.logs:
+                    for job in jobs:
+                        detail = service.get_job_detail(job.job_id)
+                        console.print(
+                            f"{job.job_id} stdout={detail.stdout_path or '-'} stderr={detail.stderr_path or '-'}"
+                        )
+                return 0
+            if args.command == "new":
+                return run_new(service, args)
+            if args.command == "connect":
+                info = service.connect_job(args.job, open_browser=not args.no_browser)
+                console.print(f"Forwarded to [green]{info.local_url}[/green]")
+                return 0
+            if args.command == "watch":
+                status = service.watch_job(args.job, connect_on_run=args.connect_on_run, console=console)
+                console.print(f"{status.job_id} {status.name} {status.state}")
+                return 0
+            if args.command == "kill":
+                job_id = service.kill_job(args.job)
+                console.print(f"Killed [cyan]{job_id}[/cyan]")
+                return 0
+        except SherlockError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 1
+        except KeyboardInterrupt:
+            console.print()
+            console.print("[yellow]Interrupted.[/yellow]")
+            return 130
+        finally:
+            service.close()
+        return 0
+
+    # Interactive mode: cluster selection loop.
+    if args.config:
+        # --config given: skip cluster selection, go straight to menu.
+        service = make_service(args.config)
+        try:
+            return interactive_menu(service)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+            return 130
+        finally:
+            service.close()
+
+    clusters = discover_configs()
+    if not clusters:
+        console.print("[red]No *_presets.toml config files found.[/red]")
+        return 1
 
     try:
-        if args.command is None:
-            return interactive_menu(service)
-        if args.command == "list":
-            jobs = service.list_jobs()
-            render_jobs_table(jobs, title=f"{cluster_name(service)} Jobs")
-            if args.logs:
-                for job in jobs:
-                    detail = service.get_job_detail(job.job_id)
-                    console.print(
-                        f"{job.job_id} stdout={detail.stdout_path or '-'} stderr={detail.stderr_path or '-'}"
-                    )
-            return 0
-        if args.command == "new":
-            return run_new(service, args)
-        if args.command == "connect":
-            info = service.connect_job(args.job, open_browser=not args.no_browser)
-            console.print(f"Forwarded to [green]{info.local_url}[/green]")
-            return 0
-        if args.command == "watch":
-            status = service.watch_job(args.job, connect_on_run=args.connect_on_run, console=console)
-            console.print(f"{status.job_id} {status.name} {status.state}")
-            return 0
-        if args.command == "kill":
-            job_id = service.kill_job(args.job)
-            console.print(f"Killed [cyan]{job_id}[/cyan]")
-            return 0
-    except SherlockError as exc:
-        console.print(f"[red]{exc}[/red]")
-        return 1
+        while True:
+            if len(clusters) == 1:
+                chosen = clusters[0]
+            else:
+                chosen = choose_cluster(clusters)
+                if chosen is None:
+                    return 0
+            _name, config_path = chosen
+            service = make_service(str(config_path))
+            try:
+                result = interactive_menu(service)
+            finally:
+                service.close()
+            if result != SWITCH_SENTINEL:
+                return result if isinstance(result, int) else 0
+            # SWITCH_SENTINEL: loop back to cluster selection
     except KeyboardInterrupt:
-        console.print()
-        console.print("[yellow]Interrupted.[/yellow]")
+        console.print("\n[yellow]Interrupted.[/yellow]")
         return 130
-    finally:
-        service.close()
-    return 0
