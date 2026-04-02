@@ -245,9 +245,23 @@ def choose_action(jobs, *, refresh_callback=None) -> str:
             elif key == "\x1b[D":
                 selected_index = (selected_index - 1) % len(MENU_ACTIONS)
                 live.update(build_main_menu_view(jobs, selected_index), refresh=True)
+            elif key in ("\x1b[A", "\x1b[B"):
+                # Up/down arrows not used in main menu — ignore silently
+                pass
+            elif key == ESC_KEY:
+                # Drain any trailing escape sequence fragments that arrived
+                # after ESC due to SSH latency (prevents e.g. "[" + "C" from
+                # being read as separate keystrokes where "C" triggers Connect)
+                while True:
+                    extra = _read_raw_key(timeout=0.05)
+                    if extra is None:
+                        break
+            elif key.startswith("\x1b"):
+                # Unknown escape sequence — ignore silently
+                pass
             elif key in {"\r", "\n"}:
                 return MENU_ACTIONS[selected_index][0]
-            else:
+            elif len(key) == 1 and key.isalpha():
                 lowered = key.lower()
                 for index, (shortcut, _label) in enumerate(MENU_ACTIONS):
                     if lowered == shortcut:
