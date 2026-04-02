@@ -198,15 +198,14 @@ def _read_raw_key(*, timeout: float | None = None) -> str | None:
         if first == "\x03":
             raise KeyboardInterrupt
         if first == "\x1b":
-            ready, _, _ = select.select([fd], [], [], 0.05)
+            sequence = [first]
+            ready, _, _ = select.select([fd], [], [], 0.1)
             if not ready:
                 return ESC_KEY
-            second = sys.stdin.read(1)
-            ready, _, _ = select.select([fd], [], [], 0.05)
-            if not ready:
-                return f"{first}{second}"
-            third = sys.stdin.read(1)
-            return f"{first}{second}{third}"
+            while ready and len(sequence) < 8:
+                sequence.append(sys.stdin.read(1))
+                ready, _, _ = select.select([fd], [], [], 0.01)
+            return "".join(sequence)
         return first
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)

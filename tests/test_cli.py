@@ -70,6 +70,22 @@ class CliTests(unittest.TestCase):
         ):
             self.assertEqual(_read_raw_key(timeout=1.0), ESC_KEY)
 
+    def test_raw_arrow_key_returns_full_escape_sequence(self):
+        fake_stdin = mock.Mock()
+        fake_stdin.fileno.return_value = 0
+        fake_stdin.read.side_effect = [ESC_KEY, "[", "C"]
+        with (
+            mock.patch("sherlock_cli.cli.sys.stdin", fake_stdin),
+            mock.patch(
+                "sherlock_cli.cli.select.select",
+                side_effect=[([0], [], []), ([0], [], []), ([0], [], []), ([], [], [])],
+            ),
+            mock.patch("sherlock_cli.cli.termios.tcgetattr", return_value=object()),
+            mock.patch("sherlock_cli.cli.termios.tcsetattr"),
+            mock.patch("sherlock_cli.cli.tty.setraw"),
+        ):
+            self.assertEqual(_read_raw_key(timeout=1.0), "\x1b[C")
+
     def test_build_jobs_table_marks_connected_jobs(self):
         jobs = [
             JobInfo(
