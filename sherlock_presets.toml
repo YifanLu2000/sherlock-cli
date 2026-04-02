@@ -1,4 +1,5 @@
 [connection]
+name = "Sherlock"
 resource = "sherlock"
 domain_name = "login.sherlock.stanford.edu"
 forward_username = "luyifan"

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import atexit
 import os
+import queue
 import shlex
 import signal
 import socket
 import subprocess
+import threading
 import time
+import uuid
 import webbrowser
 from pathlib import Path
 
-from .models import AppConfig, JobDetail, JobInfo, JobLogs, JupyterInfo, SubmissionRequest
+from .models import AppConfig, JobDetail, JobInfo, JobLogs, JobMetadata, JupyterInfo, SubmissionRequest
 from .parsing import (
     parse_job_detail,
     parse_jupyter_info,
@@ -18,12 +22,169 @@ from .parsing import (
     parse_squeue_jobs,
     rewrite_local_jupyter_url,
 )
-from .state import StateStore
+from .state import StateStore, utc_now
 
 
 class SherlockError(RuntimeError):
     pass
 
+
+class SessionDisconnectedError(SherlockError):
+    pass
+
+
+class PersistentSSHSession:
+    def __init__(
+        self,
+        resource: str | None = None,
+        *,
+        command: list[str] | None = None,
+        popen_factory=None,
+    ):
+        if command is None and resource is None:
+            raise ValueError("resource or command is required")
+        self.command = command or ["ssh", resource, "bash", "-l"]
+        self.popen_factory = popen_factory or subprocess.Popen
+        self._process = None
+        self._stdout_queue: queue.Queue[str | None] = queue.Queue()
+        self._lock = threading.Lock()
+        atexit.register(self.close)
+
+    def run(self, command: str, *, check: bool = True) -> str:
+        for attempt in range(2):
+            try:
+                return self._run_once(command, check=check)
+            except SessionDisconnectedError:
+                self.close()
+                if attempt == 1:
+                    raise
+        raise SessionDisconnectedError("Persistent SSH session disconnected.")
+
+    def write_text(self, remote_path: str, content: str) -> None:
+        delimiter = f"__SHERLOCK_FILE_{uuid.uuid4().hex}__"
+        while delimiter in content:
+            delimiter = f"__SHERLOCK_FILE_{uuid.uuid4().hex}__"
+        payload = f"cat > {shlex.quote(remote_path)} <<'{delimiter}'\n{content}"
+        if not content.endswith("\n"):
+            payload += "\n"
+        payload += f"{delimiter}"
+        self.run(payload)
+
+    def close(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        self._process = None
+        try:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.write("exit\n")
+                process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            process.terminate()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=1)
+        except Exception:
+            pass
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(process, stream_name, None)
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _run_once(self, command: str, *, check: bool) -> str:
+        with self._lock:
+            process = self._ensure_started()
+            self._drain_queue(self._stdout_queue)
+
+            token = uuid.uuid4().hex
+            stdout_end = f"__SHERLOCK_STDOUT_END_{token}__"
+            exit_prefix = f"__SHERLOCK_EXIT_{token}__:"
+            payload = (
+                "{\n"
+                f"{command}\n"
+                "} 2>&1\n"
+                "__sherlock_status=$?\n"
+                f"printf '%s%s\\n' {shlex.quote(exit_prefix)} \"$__sherlock_status\"\n"
+                f"printf '%s\\n' {shlex.quote(stdout_end)}\n"
+            )
+
+            try:
+                assert process.stdin is not None
+                process.stdin.write(payload)
+                process.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise SessionDisconnectedError("Could not write to persistent SSH session.") from exc
+
+            stdout, returncode = self._collect_stdout(stdout_end, exit_prefix)
+            stdout_text = stdout.strip()
+            if check and returncode != 0:
+                raise SherlockError(stdout_text or f"Remote command failed: {command}")
+            return stdout_text
+
+    def _ensure_started(self):
+        if self._process is not None and self._process.poll() is None:
+            return self._process
+        self.close()
+        process = self.popen_factory(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            bufsize=1,
+        )
+        if process.stdin is None or process.stdout is None:
+            raise SessionDisconnectedError("Persistent SSH session did not expose stdio pipes.")
+        self._process = process
+        self._stdout_queue = queue.Queue()
+        threading.Thread(
+            target=self._pump_stream,
+            args=(process.stdout, self._stdout_queue),
+            daemon=True,
+        ).start()
+        return process
+
+    @staticmethod
+    def _pump_stream(stream, output_queue) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                output_queue.put(line)
+        finally:
+            output_queue.put(None)
+
+    @staticmethod
+    def _drain_queue(output_queue) -> None:
+        while True:
+            try:
+                output_queue.get_nowait()
+            except queue.Empty:
+                return
+
+    def _collect_stdout(self, end_marker: str, exit_prefix: str) -> tuple[str, int]:
+        chunks: list[str] = []
+        returncode: int | None = None
+        while True:
+            item = self._stdout_queue.get()
+            if item is None:
+                raise SessionDisconnectedError("Persistent SSH session stdout closed unexpectedly.")
+            if exit_prefix in item:
+                prefix, _marker, suffix = item.partition(exit_prefix)
+                if prefix:
+                    chunks.append(prefix)
+                returncode = int(suffix.strip())
+                continue
+            if item.rstrip("\n") == end_marker:
+                if returncode is None:
+                    raise SessionDisconnectedError("Persistent SSH session did not report a return code.")
+                return "".join(chunks), returncode
+            chunks.append(item)
 
 class SherlockService:
     def __init__(
@@ -33,6 +194,7 @@ class SherlockService:
         *,
         runner=None,
         popen_factory=None,
+        ssh_session_factory=None,
         sleeper=None,
         browser_opener=None,
     ):
@@ -40,12 +202,21 @@ class SherlockService:
         self.state = state
         self.runner = runner or subprocess.run
         self.popen_factory = popen_factory or subprocess.Popen
+        self.ssh_session_factory = ssh_session_factory or self._build_ssh_session
         self.sleeper = sleeper or time.sleep
         self.browser_opener = browser_opener or webbrowser.open
         self._remote_home: str | None = None
         self._remote_util_dir: str | None = None
+        self._ssh_session = None
+
+    def close(self) -> None:
+        if self._ssh_session is None:
+            return
+        self._ssh_session.close()
+        self._ssh_session = None
 
     def list_jobs(self) -> list[JobInfo]:
+        connected_job_ids = self._connected_job_ids()
         output = self._ssh_output(
             self._remote_bash(
                 "squeue -u {user} --states=PENDING,RUNNING -o '%i|%j|%T|%P|%R|%M' -h".format(
@@ -54,6 +225,8 @@ class SherlockService:
             )
         )
         jobs = parse_squeue_jobs(output, self.state.managed_job_ids())
+        for job in jobs:
+            job.connected = job.job_id in connected_job_ids
         jobs.sort(key=lambda job: (job.state != "RUNNING", job.job_id))
         return jobs
 
@@ -77,11 +250,14 @@ class SherlockService:
         return detail
 
     def get_job_status(self, job_id: str) -> JobInfo | None:
+        connected_job_ids = self._connected_job_ids()
         queue_output = self._ssh_output(
             self._remote_bash(f"squeue -j {shlex.quote(job_id)} -o '%i|%j|%T|%P|%R|%M' -h")
         )
         if queue_output.strip():
-            return parse_squeue_jobs(queue_output, self.state.managed_job_ids())[0]
+            status = parse_squeue_jobs(queue_output, self.state.managed_job_ids())[0]
+            status.connected = status.job_id in connected_job_ids
+            return status
         history_output = self._ssh_output(
             self._remote_bash(
                 "sacct -j {job_id} --format=JobIDRaw,JobName,State,Partition,NodeList,Elapsed -P -n".format(
@@ -89,7 +265,10 @@ class SherlockService:
                 )
             )
         )
-        return parse_sacct_job(history_output, self.state.managed_job_ids())
+        status = parse_sacct_job(history_output, self.state.managed_job_ids())
+        if status:
+            status.connected = status.job_id in connected_job_ids
+        return status
 
     def submit_job(self, request: SubmissionRequest) -> str:
         remote_util_dir = self.remote_util_dir
@@ -98,13 +277,7 @@ class SherlockService:
             raise SherlockError(f"sbatch template not found: {template_path}")
 
         remote_template = f"{remote_util_dir}/{template_path.name}"
-        self._run(
-            [
-                "scp",
-                str(template_path),
-                f"{self.config.connection.resource}:{remote_template}",
-            ]
-        )
+        self._upload_text_file(template_path, remote_template)
 
         stdout_pattern = f"{remote_util_dir}/{request.job_name}-%j.out"
         stderr_pattern = f"{remote_util_dir}/{request.job_name}-%j.err"
@@ -130,6 +303,8 @@ class SherlockService:
             "--mail-user",
             self.config.connection.email,
         ]
+        if request.account:
+            sbatch_args.extend(["-A", request.account])
         if request.nodelist:
             sbatch_args.extend(["--nodelist", request.nodelist])
         if request.constraint:
@@ -188,12 +363,15 @@ class SherlockService:
         metadata = self.state.get(job_id)
         remote_port = metadata.remote_port if metadata else None
         jupyter = self.wait_for_jupyter(job_id, fallback_port=remote_port)
-        local_port = self._choose_local_port(jupyter.port)
         existing = metadata.tunnel_pid if metadata else None
         if existing and self._pid_alive(existing):
             jupyter.local_port = metadata.local_port
             jupyter.local_url = metadata.jupyter_url
             return jupyter
+        local_port = self._choose_local_port(jupyter.port)
+
+        if not metadata:
+            metadata = self._adopt_external_job(job_id, detail, jupyter.port)
 
         tunnel = self._start_tunnel(
             node=detail.node_list,
@@ -271,6 +449,20 @@ class SherlockService:
             self._remote_home = self._ssh_output(self._remote_bash("printf '%s' \"$HOME\"")).strip()
         return self._remote_home
 
+    def _adopt_external_job(self, job_id: str, detail: JobDetail, remote_port: int) -> JobMetadata:
+        metadata = JobMetadata(
+            job_id=job_id,
+            job_name=detail.name,
+            preset_id="",
+            notebook_dir="",
+            remote_port=remote_port,
+            remote_stdout=detail.stdout_path or "",
+            remote_stderr=detail.stderr_path or "",
+            remote_template="",
+            created_at=utc_now(),
+        )
+        return self.state.upsert(metadata)
+
     def _job_is_isolated(self, metadata, detail: JobDetail | None = None) -> bool:
         if metadata is None:
             if detail:
@@ -284,30 +476,34 @@ class SherlockService:
     def _read_remote_file(self, path: str, lines: int) -> str:
         return self._ssh_output(self._remote_bash(f"tail -n {int(lines)} {shlex.quote(path)}"), check=False)
 
+    def _connected_job_ids(self) -> set[str]:
+        connected: set[str] = set()
+        for job_id, metadata in self.state.jobs.items():
+            if metadata.tunnel_pid and self._pid_alive(metadata.tunnel_pid):
+                connected.add(job_id)
+        return connected
+
+    def _upload_text_file(self, local_path: Path, remote_path: str) -> None:
+        self._ssh_session_or_create().write_text(remote_path, local_path.read_text())
+
     def _start_tunnel(self, *, node: str, remote_port: int, local_port: int, isolated_compute_node: bool):
         if not node:
             raise SherlockError("Job does not have an assigned node yet.")
         if isolated_compute_node:
-            args = [
-                "ssh",
-                "-L",
-                f"{local_port}:localhost:{remote_port}",
-                self.config.connection.resource,
-                "ssh",
-                "-L",
-                f"{remote_port}:localhost:{remote_port}",
-                "-N",
-                node,
-            ]
+            args = self._login_ssh_args()
+            args.extend(
+                [
+                    "-L",
+                    f"{local_port}:localhost:{remote_port}",
+                    "ssh",
+                    "-L",
+                    f"{remote_port}:localhost:{remote_port}",
+                    "-N",
+                    node,
+                ]
+            )
         else:
-            args = [
-                "ssh",
-                self.config.connection.domain_name,
-                "-l",
-                self.config.connection.forward_username,
-            ]
-            if self.config.connection.use_kerberos:
-                args.append("-K")
+            args = self._login_ssh_args()
             args.extend(["-L", f"{local_port}:{node}:{remote_port}", "-N"])
         return self.popen_factory(
             args,
@@ -319,9 +515,7 @@ class SherlockService:
     def _choose_local_port(self, preferred: int) -> int:
         if self._port_available(preferred):
             return preferred
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.bind(("127.0.0.1", 0))
-            return int(sock.getsockname()[1])
+        raise SherlockError(f"Local port {preferred} is already in use.")
 
     @staticmethod
     def _port_available(port: int) -> bool:
@@ -353,20 +547,36 @@ class SherlockService:
     def _shell_join(args: list[str]) -> str:
         return " ".join(shlex.quote(arg) for arg in args)
 
-    def _remote_bash(self, command: str) -> list[str]:
-        return [
-            "ssh",
-            self.config.connection.resource,
-            f"bash -lc {shlex.quote(command)}",
-        ]
+    def _login_ssh_args(self) -> list[str]:
+        args = ["ssh"]
+        if self.config.connection.use_kerberos:
+            args.append("-K")
+        args.extend(
+            [
+                "-l",
+                self.config.connection.forward_username,
+                self.config.connection.domain_name,
+            ]
+        )
+        return args
 
-    def _run(self, args: list[str], *, check: bool = True):
-        result = self.runner(args, stdout=subprocess.PIPE, stderr=None, text=True)
-        if check and result.returncode != 0:
-            stdout = (result.stdout or "").strip()
-            raise SherlockError(stdout or f"Command failed: {args}")
-        return result
+    def _build_ssh_session(self) -> PersistentSSHSession:
+        command = self._login_ssh_args()
+        command.extend(["bash", "-l"])
+        return PersistentSSHSession(command=command)
 
-    def _ssh_output(self, args: list[str], *, check: bool = True) -> str:
-        result = self._run(args, check=check)
-        return (result.stdout or "").strip()
+    def _ssh_session_or_create(self):
+        if self._ssh_session is None:
+            self._ssh_session = self.ssh_session_factory()
+        return self._ssh_session
+
+    @staticmethod
+    def _remote_bash(command: str) -> str:
+        return command
+
+    def _ssh_output(self, command: str, *, check: bool = True) -> str:
+        try:
+            return self._ssh_session_or_create().run(command, check=check)
+        except SessionDisconnectedError:
+            self.close()
+            raise SherlockError("Persistent SSH session disconnected.")

@@ -35,6 +35,7 @@ def parse_squeue_jobs(output: str, managed_job_ids: set[str]) -> list[JobInfo]:
                 reason_or_node=reason_or_node,
                 elapsed=elapsed,
                 origin="CLI-managed" if job_id in managed_job_ids else "external",
+                connected=False,
             )
         )
     return jobs
@@ -58,6 +59,7 @@ def parse_sacct_job(output: str, managed_job_ids: set[str]) -> JobInfo | None:
             reason_or_node=node_list,
             elapsed=elapsed,
             origin="CLI-managed" if job_id in managed_job_ids else "external",
+            connected=False,
         )
     return None
 

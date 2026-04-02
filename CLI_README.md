@@ -1,6 +1,6 @@
 # Sherlock CLI
 
-`sherlock-cli` is a Python CLI for submitting and managing Sherlock JupyterLab jobs.
+`sherlock-cli` is a Python CLI for submitting and managing Slurm-backed JupyterLab jobs on configured clusters such as Sherlock and Marlowe.
 
 ## Install
 
@@ -14,9 +14,15 @@ After installation, the command is:
 sherlock-cli
 ```
 
+The default config targets Sherlock. To use Marlowe, pass:
+
+```bash
+sherlock-cli --config marlowe_presets.toml
+```
+
 ## What It Does
 
-- Shows all of your current Sherlock `PENDING` and `RUNNING` jobs in a table
+- Shows all of your current configured-cluster `PENDING` and `RUNNING` jobs in a table
 - Marks jobs as `CLI-managed` or `external`
 - Lets you submit a new JupyterLab job from a preset
 - Watches a job until it starts or reaches a terminal state
@@ -56,7 +62,8 @@ Menu controls:
 - shortcut keys also work: `r`, `n`, `c`, `w`, `k`, `l`, `q`
 - in interactive mode, press `Ctrl+C` twice within 2 seconds to exit
 
-The menu now fetches Sherlock job status once per screen refresh. Moving left and right does not trigger a new SSH query.
+The menu now fetches cluster job status once per screen refresh. Moving left and right does not trigger a new SSH query.
+This experimental branch also keeps a single long-lived `ssh ... bash -l` session open for the lifetime of the CLI process, so repeated remote queries and sbatch template uploads avoid reconnecting for each action.
 
 When an action needs a specific job, the CLI opens a second selector:
 
@@ -70,7 +77,7 @@ For `Connect`, the selector only shows jobs that are already `RUNNING`.
 
 ### `sherlock-cli list`
 
-Show all current `PENDING` and `RUNNING` jobs for the configured Sherlock user.
+Show all current `PENDING` and `RUNNING` jobs for the configured cluster user.
 
 ```bash
 sherlock-cli list
@@ -115,6 +122,7 @@ Supported flags:
 - `--notebook-dir`
 - `--port`
 - `--partition`
+- `--account`
 - `--mem`
 - `--time`
 - `--cpus`
@@ -125,7 +133,7 @@ Supported flags:
 
 Behavior:
 
-- uploads the configured `.sbatch` template to Sherlock
+- uploads the configured `.sbatch` template to the target cluster
 - submits the Slurm job with stable stdout and stderr file names
 - records the job in the local state file
 - watches until the job starts or exits
@@ -177,7 +185,7 @@ If the CLI created a local SSH tunnel for that job, it also terminates the local
 
 ## Presets
 
-The unified preset configuration lives in `sherlock_presets.toml`.
+The repo currently ships with `sherlock_presets.toml` and `marlowe_presets.toml`.
 
 Current presets:
 
@@ -189,6 +197,7 @@ Current presets:
 - `owner-gpu`
 - `bigmem`
 - `stanford-gpu`
+- `marlowe-batch-gpu`
 
 Each preset defines:
 
@@ -217,14 +226,16 @@ sherlock-cli --config /path/to/config.toml list
 
 The config controls:
 
-- Sherlock login host
-- Sherlock username
+- cluster name and login host
+- cluster username
 - email
 - default notebook directory
 - remote utility directory
 - watch polling interval
 - startup timeout
 - all preset definitions
+
+The Marlowe preset uses `batch`, `gpu:1`, `time=02:00:00`, and `account=marlowe-m000134-pm05`, matching the equivalent `srun` allocation you provided.
 
 ## Local State
 
@@ -282,5 +293,6 @@ sherlock-cli kill 123456
 
 - The CLI is centered on JupyterLab jobs.
 - Existing shell scripts are still in the repo, but the Python CLI is the main interface now.
-- External Sherlock jobs are shown in the table, but CLI state tracking only exists for jobs created by this CLI.
+- External cluster jobs are shown in the table, but CLI state tracking only exists for jobs created by this CLI.
 - For external jobs, connect behavior depends on whether the job logs and node information are available and Jupyter can be detected from logs.
+- Marlowe forwarding is configured through the login node instead of `ssh`-ing into the compute node directly.
