@@ -67,6 +67,7 @@ Available actions:
 - `Watch`
 - `Kill`
 - `Logs`
+- `Remote`
 - `Quit`
 
 Menu controls:
@@ -86,6 +87,8 @@ When an action needs a specific job, the CLI opens a second selector:
 - Enter selects the highlighted job
 
 For `Connect`, the selector only shows jobs that are already `RUNNING`.
+
+Selecting `Remote` opens a second menu for remote session actions. Choosing `Attach` there shows current `RUNNING` jobs and lets you select the target with up/down arrows or `j` / `k`.
 
 ## Subcommands
 

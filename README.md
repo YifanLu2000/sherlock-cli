@@ -32,6 +32,8 @@ Interactive mode:
 sherlock-cli
 ```
 
+The interactive home screen now includes a `Remote` action. Enter it to run `setup`, `attach`, `start`, `connect`, `stop`, or `clean` without typing the full subcommand. For `Attach`, the CLI shows running jobs and lets you choose with the up/down keys.
+
 Marlowe:
 
 ```bash

@@ -18,7 +18,7 @@ from rich.text import Text
 from rich.table import Table
 
 from .config import discover_configs, load_config
-from .models import JobLogs, Preset, SubmissionRequest
+from .models import JobLogs, Preset, RemoteProfile, SubmissionRequest
 from .remote import RemoteService
 from .service import SherlockError, SherlockService
 from .state import StateStore
@@ -32,8 +32,18 @@ MENU_ACTIONS = [
     ("w", "Watch"),
     ("k", "Kill"),
     ("l", "Logs"),
+    ("m", "Remote"),
     ("s", "Switch"),
     ("q", "Quit"),
+]
+REMOTE_ACTIONS = [
+    ("a", "Attach"),
+    ("t", "Start"),
+    ("c", "Connect"),
+    ("s", "Stop"),
+    ("u", "Setup"),
+    ("n", "Clean"),
+    ("b", "Back"),
 ]
 INTERRUPT_EXIT_WINDOW_SECONDS = 2.0
 
@@ -185,9 +195,9 @@ def render_logs(logs: JobLogs) -> None:
     console.print(logs.stderr or "<empty>")
 
 
-def build_action_selector(selected_index: int):
-    text = Text("Actions: ")
-    for index, (key, label) in enumerate(MENU_ACTIONS):
+def build_shortcut_selector(title: str, actions, selected_index: int):
+    text = Text(f"{title}: ")
+    for index, (key, label) in enumerate(actions):
         if index > 0:
             text.append("  ")
         if index == selected_index:
@@ -195,6 +205,11 @@ def build_action_selector(selected_index: int):
         else:
             text.append(f" {label} ", style="white on rgb(60,60,60)")
         text.append(f" [{key}]", style="dim")
+    return text
+
+
+def build_action_selector(selected_index: int):
+    text = build_shortcut_selector("Actions", MENU_ACTIONS, selected_index)
     help_text = Text("Use left/right arrows, or press the shortcut key, then Enter.", style="dim")
     return Group(text, help_text)
 
@@ -212,6 +227,35 @@ def build_job_selector_view(jobs, selected_index: int, *, action_label: str):
         build_jobs_table(jobs, title=f"Select Job To {action_label}", selected_index=selected_index),
         help_text,
     )
+
+
+def build_remote_action_selector(selected_index: int):
+    text = build_shortcut_selector("Remote", REMOTE_ACTIONS, selected_index)
+    help_text = Text("Use left/right arrows, Enter to run, Esc or Back to return.", style="dim")
+    return Group(text, help_text)
+
+
+def build_remote_menu_view(service: RemoteService, jobs, selected_index: int):
+    session = service.read_remote_session()
+    if session is None:
+        status = Text("Remote session: none", style="yellow")
+    else:
+        status = Text(
+            f"Remote session: job {session.job_id} on {session.node}:{session.port} ({session.session_type})",
+            style="green",
+        )
+    running_jobs = [job for job in jobs if job.state == "RUNNING"]
+    title = f"{cluster_name(service)} Remote Jobs"
+    if running_jobs:
+        return Group(
+            build_jobs_table(running_jobs, title=title),
+            status,
+            build_remote_action_selector(selected_index),
+        )
+    empty = Table(title=title)
+    empty.add_column("Status")
+    empty.add_row("No RUNNING jobs available for remote attach.")
+    return Group(empty, status, build_remote_action_selector(selected_index))
 
 
 def _read_raw_key(*, timeout: float | None = None) -> str | None:
@@ -288,6 +332,38 @@ def choose_action(jobs, *, refresh_callback=None) -> str:
                 if lowered == "h":
                     selected_index = (selected_index - 1) % len(MENU_ACTIONS)
                     live.update(build_main_menu_view(jobs, selected_index), refresh=True)
+
+
+def choose_remote_action(service: RemoteService, jobs, *, refresh_callback=None) -> str | None:
+    if not sys.stdin.isatty():
+        console.print(build_remote_menu_view(service, jobs, 0))
+        choices = [key for key, _label in REMOTE_ACTIONS]
+        return Prompt.ask("Choose remote action", choices=choices, default="a").lower()
+
+    selected_index = 0
+    with Live(build_remote_menu_view(service, jobs, selected_index), console=console, auto_refresh=False) as live:
+        while True:
+            key = _read_raw_key(timeout=AUTO_REFRESH_SECONDS)
+            if key is None:
+                if refresh_callback:
+                    jobs = refresh_callback()
+                    live.update(build_remote_menu_view(service, jobs, selected_index), refresh=True)
+                continue
+            if key == ESC_KEY:
+                return "b"
+            if key == "\x1b[C":
+                selected_index = (selected_index + 1) % len(REMOTE_ACTIONS)
+                live.update(build_remote_menu_view(service, jobs, selected_index), refresh=True)
+            elif key == "\x1b[D":
+                selected_index = (selected_index - 1) % len(REMOTE_ACTIONS)
+                live.update(build_remote_menu_view(service, jobs, selected_index), refresh=True)
+            elif key in {"\r", "\n"}:
+                return REMOTE_ACTIONS[selected_index][0]
+            else:
+                lowered = key.lower()
+                for shortcut, _label in REMOTE_ACTIONS:
+                    if lowered == shortcut:
+                        return shortcut
 
 
 def choose_job(jobs, *, action_label: str):
@@ -375,6 +451,65 @@ def select_preset(service: SherlockService) -> Preset | None:
                 return None
             elif key in {"\r", "\n"}:
                 return presets[selected_index]
+
+
+def build_remote_profile_table(profiles: list[RemoteProfile], *, selected_index: int | None = None) -> Table:
+    table = Table(title="Select Remote Profile")
+    if selected_index is not None:
+        table.add_column("", no_wrap=True, width=2)
+    table.add_column("Profile", style="cyan")
+    table.add_column("Partition")
+    table.add_column("Resources")
+    table.add_column("Time")
+    for idx, profile in enumerate(profiles):
+        resources = f"{profile.cpus} CPU"
+        if profile.gpus:
+            resources += f", {profile.gpus} GPU"
+        label = profile.label or profile.job_name
+        row = [f"{profile.id} ({label})", profile.partition, resources, profile.time]
+        style = None
+        if selected_index is not None:
+            row.insert(0, ">" if idx == selected_index else "")
+            style = "bold black on cyan" if idx == selected_index else None
+        table.add_row(*row, style=style)
+    return table
+
+
+def build_remote_profile_selector_view(profiles: list[RemoteProfile], selected_index: int):
+    help_text = Text("Use up/down arrows or j/k, Enter to select, Esc to go back.", style="dim")
+    return Group(build_remote_profile_table(profiles, selected_index=selected_index), help_text)
+
+
+def select_remote_profile(service: RemoteService) -> RemoteProfile | None:
+    profiles = list(service.config.remote_profiles.values())
+    if not profiles:
+        raise SherlockError(f"No remote profiles configured for {cluster_name(service)}.")
+
+    if not sys.stdin.isatty():
+        console.print(build_remote_profile_table(profiles))
+        choice = IntPrompt.ask("Select remote profile (number)", default=1)
+        if choice < 1 or choice > len(profiles):
+            raise SherlockError("Invalid remote profile selection.")
+        return profiles[choice - 1]
+
+    selected_index = 0
+    with Live(
+        build_remote_profile_selector_view(profiles, selected_index),
+        console=console,
+        auto_refresh=False,
+    ) as live:
+        while True:
+            key = _read_raw_key()
+            if key == "\x1b[B" or key.lower() == "j":
+                selected_index = (selected_index + 1) % len(profiles)
+                live.update(build_remote_profile_selector_view(profiles, selected_index), refresh=True)
+            elif key == "\x1b[A" or key.lower() == "k":
+                selected_index = (selected_index - 1) % len(profiles)
+                live.update(build_remote_profile_selector_view(profiles, selected_index), refresh=True)
+            elif key == ESC_KEY:
+                return None
+            elif key in {"\r", "\n"}:
+                return profiles[selected_index]
 
 
 def build_submission_request(service: SherlockService, args) -> SubmissionRequest | None:
@@ -522,6 +657,42 @@ def run_remote(service: RemoteService, args) -> int:
     raise SherlockError(f"Unknown remote command: {args.remote_command}")
 
 
+def interactive_remote_menu(service: RemoteService) -> None:
+    while True:
+        jobs = service.list_jobs()
+        action = choose_remote_action(service, jobs, refresh_callback=service.list_jobs)
+        if action in {None, "b"}:
+            return
+        if action == "a":
+            target = choose_job([job for job in jobs if job.state == "RUNNING"], action_label="Attach Remote")
+            if target is None:
+                continue
+            session = service.attach(target.job_id)
+            render_remote_session(service, session)
+        elif action == "t":
+            profile = select_remote_profile(service)
+            if profile is None:
+                continue
+            session = service.start(profile.id)
+            render_remote_session(service, session)
+        elif action == "c":
+            session = service.connect_remote()
+            render_remote_session(service, session)
+        elif action == "s":
+            session = service.stop()
+            console.print(
+                f"Stopped remote session for job [cyan]{session.job_id}[/cyan] "
+                f"([bold]{session.session_type}[/bold])."
+            )
+        elif action == "u":
+            service.setup_full()
+            console.print(f"Local and remote setup complete for [bold]{cluster_name(service)}[/bold].")
+        elif action == "n":
+            service.clean()
+            console.print(f"Removed local SSH config for [bold]{service.compute_host_alias}[/bold].")
+        Prompt.ask("Press Enter to continue", default="")
+
+
 LOGO = """\
 [bold cyan]\
    ___  _         _           _
@@ -628,7 +799,7 @@ def show_splash_and_load(service: SherlockService) -> list:
     return result
 
 
-def interactive_menu(service: SherlockService) -> int | str:
+def interactive_menu(service: RemoteService) -> int | str:
     interrupt_tracker = InterruptTracker()
     first_load = True
     while True:
@@ -697,6 +868,9 @@ def interactive_menu(service: SherlockService) -> int | str:
                     should_pause = False
                     continue
                 render_logs(service.get_job_logs(target.job_id))
+            elif action in {"m", "remote"}:
+                interactive_remote_menu(service)
+                should_pause = False
             elif action in {"s", "switch"}:
                 return SWITCH_SENTINEL
             else:
@@ -764,7 +938,7 @@ def main(argv: list[str] | None = None) -> int:
     # Interactive mode: cluster selection loop.
     if args.config:
         # --config given: skip cluster selection, go straight to menu.
-        service = make_service(args.config)
+        service = make_remote_service(args.config)
         try:
             return interactive_menu(service)
         except KeyboardInterrupt:
@@ -787,7 +961,7 @@ def main(argv: list[str] | None = None) -> int:
                 if chosen is None:
                     return 0
             _name, config_path = chosen
-            service = make_service(str(config_path))
+            service = make_remote_service(str(config_path))
             try:
                 result = interactive_menu(service)
             finally:
