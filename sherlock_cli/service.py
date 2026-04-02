@@ -584,6 +584,10 @@ class SherlockService:
         command.extend(["bash", "-l"])
         return PersistentSSHSession(command=command, log_path=self.ssh_log_path)
 
+    def ensure_connected(self) -> None:
+        """Establish the SSH session, allowing interactive auth (password/2FA)."""
+        self._ssh_session_or_create()
+
     def _ssh_session_or_create(self):
         if self._ssh_session is None:
             self._ssh_session = self.ssh_session_factory()

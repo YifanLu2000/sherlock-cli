@@ -484,25 +484,8 @@ def choose_cluster(clusters: list[tuple[str, object]]) -> tuple[str, object] | N
                 return None
 
 
-def _tail_last_line(path) -> str:
-    """Return the last non-empty line of a file, or empty string."""
-    try:
-        with open(path) as fh:
-            lines = fh.readlines()
-        for line in reversed(lines):
-            stripped = line.strip()
-            if stripped:
-                return stripped
-    except (OSError, ValueError):
-        pass
-    return ""
-
-
 def show_splash_and_load(service: SherlockService) -> list:
     import threading
-
-    result = []
-    error = []
 
     # Truncate old log so we only see fresh output for this connection attempt.
     log_path = service.ssh_log_path
@@ -511,6 +494,17 @@ def show_splash_and_load(service: SherlockService) -> list:
         log_path.write_text("")
     except OSError:
         pass
+
+    # Phase 1: establish SSH session WITHOUT Live so that password / 2FA
+    # prompts (written to /dev/tty by SSH) are visible and interactive.
+    console.print(Text.from_markup(LOGO))
+    console.print(f"[dim]Connecting to {cluster_name(service)}...[/dim]")
+    console.print(f"[dim italic]Log: {log_path}[/dim italic]")
+    service.ensure_connected()
+
+    # Phase 2: SSH is up — fetch jobs with a spinner.
+    result = []
+    error = []
 
     def fetch():
         try:
@@ -521,21 +515,9 @@ def show_splash_and_load(service: SherlockService) -> list:
     thread = threading.Thread(target=fetch, daemon=True)
     thread.start()
 
-    def build_splash():
-        last_log = _tail_last_line(log_path)
-        log_line = Text(f"  {last_log}", style="dim") if last_log else Text("")
-        log_hint = Text(f"  Log: {log_path}", style="dim italic")
-        return Group(
-            Text.from_markup(LOGO),
-            Spinner("dots", text=f"[dim]Connecting to {cluster_name(service)}...[/dim]"),
-            log_line,
-            log_hint,
-        )
-
-    with Live(build_splash(), console=console, auto_refresh=True, refresh_per_second=4) as live:
-        while thread.is_alive():
-            thread.join(timeout=0.25)
-            live.update(build_splash())
+    spinner = Spinner("dots", text=f"[dim]Loading jobs from {cluster_name(service)}...[/dim]")
+    with Live(spinner, console=console, auto_refresh=True, refresh_per_second=10):
+        thread.join()
 
     if error:
         raise error[0]
