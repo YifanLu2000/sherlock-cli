@@ -2,6 +2,8 @@
 
 Python CLI for submitting and managing Sherlock JupyterLab jobs.
 
+The repo now includes cluster configs for both Sherlock and Marlowe.
+
 Detailed CLI documentation lives in `CLI_README.md`.
 
 ## Install
@@ -12,10 +14,18 @@ python3 -m pip install -e .
 
 ## Usage
 
+Sherlock (default config):
+
 Interactive mode:
 
 ```bash
 sherlock-cli
+```
+
+Marlowe:
+
+```bash
+sherlock-cli --config marlowe_presets.toml
 ```
 
 Subcommands:
@@ -30,7 +40,10 @@ sherlock-cli kill 123456
 
 ## Presets
 
-The unified preset config lives in `sherlock_presets.toml`.
+The repo includes:
+
+- `sherlock_presets.toml`
+- `marlowe_presets.toml`
 
 Default presets:
 
@@ -42,3 +55,4 @@ Default presets:
 - `owner-gpu`
 - `bigmem`
 - `stanford-gpu`
+- `marlowe-batch-gpu`
