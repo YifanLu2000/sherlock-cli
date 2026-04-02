@@ -198,13 +198,23 @@ def _read_raw_key(*, timeout: float | None = None) -> str | None:
         if first == "\x03":
             raise KeyboardInterrupt
         if first == "\x1b":
-            sequence = [first]
             ready, _, _ = select.select([fd], [], [], 0.1)
             if not ready:
                 return ESC_KEY
+
+            second = sys.stdin.read(1)
+            if second not in {"[", "O"}:
+                return f"{first}{second}"
+
+            sequence = [first, second]
+            ready, _, _ = select.select([fd], [], [], 0.1)
             while ready and len(sequence) < 8:
                 sequence.append(sys.stdin.read(1))
-                ready, _, _ = select.select([fd], [], [], 0.01)
+                # Arrow keys and similar terminal controls often arrive as ESC [ X or ESC O X.
+                # Once we have the final alphabetic byte, stop instead of leaking it into the next read.
+                if sequence[-1].isalpha() or sequence[-1] == "~":
+                    break
+                ready, _, _ = select.select([fd], [], [], 0.1)
             return "".join(sequence)
         return first
     finally:
