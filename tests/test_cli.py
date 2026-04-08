@@ -1,21 +1,27 @@
 from unittest import mock
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from rich.text import Text
 
 from sherlock_cli.cli import (
     ESC_KEY,
     InterruptTracker,
+    MENU_ACTIONS,
     SWITCH_SENTINEL,
     _read_raw_key,
     build_jobs_table,
     choose_cluster,
     choose_job,
+    select_remote_profile,
     select_preset,
     should_exit_on_interrupt,
 )
-from sherlock_cli.config import discover_configs
+from sherlock_cli.config import discover_configs, load_config
 from sherlock_cli.models import ConnectionConfig, JobInfo, Preset
+from sherlock_cli.remote import RemoteService
+from sherlock_cli.state import StateStore
 
 
 class DummyLive:
@@ -201,6 +207,21 @@ class CliTests(unittest.TestCase):
 
     def test_switch_sentinel_is_string(self):
         self.assertIsInstance(SWITCH_SENTINEL, str)
+
+    def test_main_menu_contains_remote_action(self):
+        self.assertIn(("m", "Remote"), MENU_ACTIONS)
+
+    def test_select_remote_profile_escape_returns_none(self):
+        with TemporaryDirectory() as tmpdir:
+            config = load_config()
+            config.state_path = Path(tmpdir) / "state.json"
+            service = RemoteService(config, StateStore(config.state_path))
+            with (
+                mock.patch("sherlock_cli.cli.sys.stdin.isatty", return_value=True),
+                mock.patch("sherlock_cli.cli._read_raw_key", return_value=ESC_KEY),
+                mock.patch("sherlock_cli.cli.Live", DummyLive),
+            ):
+                self.assertIsNone(select_remote_profile(service))
 
 
 if __name__ == "__main__":
