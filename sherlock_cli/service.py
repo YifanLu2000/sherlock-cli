@@ -241,6 +241,7 @@ class SherlockService:
         jobs = parse_squeue_jobs(output, self.state.managed_job_ids())
         for job in jobs:
             job.connected = job.job_id in connected_job_ids
+            job.remote_port = self._resolve_remote_port(job.name, self.state.get(job.job_id))
         jobs.sort(key=lambda job: (job.state != "RUNNING", job.job_id))
         return jobs
 
@@ -271,6 +272,7 @@ class SherlockService:
         if queue_output.strip():
             status = parse_squeue_jobs(queue_output, self.state.managed_job_ids())[0]
             status.connected = status.job_id in connected_job_ids
+            status.remote_port = self._resolve_remote_port(status.name, self.state.get(status.job_id))
             return status
         history_output = self._ssh_output(
             self._remote_bash(
@@ -282,6 +284,7 @@ class SherlockService:
         status = parse_sacct_job(history_output, self.state.managed_job_ids())
         if status:
             status.connected = status.job_id in connected_job_ids
+            status.remote_port = self._resolve_remote_port(status.name, self.state.get(status.job_id))
         return status
 
     def submit_job(self, request: SubmissionRequest) -> str:
@@ -375,8 +378,11 @@ class SherlockService:
             raise SherlockError(f"Job {job_id} is not RUNNING. Current state: {detail.state}")
 
         metadata = self.state.get(job_id)
-        remote_port = metadata.remote_port if metadata else None
-        jupyter = self.wait_for_jupyter(job_id, fallback_port=remote_port)
+        remote_port = self._resolve_remote_port(detail.name, metadata)
+        if remote_port is None:
+            jupyter = self.wait_for_jupyter(job_id)
+        else:
+            jupyter = self._build_direct_jupyter_info(remote_port, metadata)
         existing = metadata.tunnel_pid if metadata else None
         if existing and self._pid_alive(existing):
             jupyter.local_port = metadata.local_port
@@ -476,6 +482,20 @@ class SherlockService:
             created_at=utc_now(),
         )
         return self.state.upsert(metadata)
+
+    def _resolve_remote_port(self, job_name: str, metadata=None) -> int | None:
+        if metadata and metadata.remote_port:
+            return metadata.remote_port
+        matching_ports = {preset.port for preset in self.config.presets.values() if preset.job_name == job_name}
+        if len(matching_ports) == 1:
+            return matching_ports.pop()
+        return None
+
+    @staticmethod
+    def _build_direct_jupyter_info(remote_port: int, metadata=None) -> JupyterInfo:
+        if metadata and metadata.jupyter_url:
+            return JupyterInfo(url=metadata.jupyter_url, port=remote_port)
+        return JupyterInfo(url=f"http://localhost:{remote_port}/", port=remote_port)
 
     def _job_is_isolated(self, metadata, detail: JobDetail | None = None) -> bool:
         if metadata is None:

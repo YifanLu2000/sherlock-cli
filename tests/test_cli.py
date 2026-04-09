@@ -105,6 +105,7 @@ class CliTests(unittest.TestCase):
                 name="GPU-jupyterlab",
                 state="RUNNING",
                 partition="gpu",
+                remote_port=56793,
                 reason_or_node="sh03-01",
                 elapsed="01:23",
                 origin="CLI-managed",
@@ -116,13 +117,15 @@ class CliTests(unittest.TestCase):
 
         name_cell = table.columns[1]._cells[0]
         state_cell = table.columns[2]._cells[0]
-        origin_cell = table.columns[6]._cells[0]
+        port_cell = table.columns[4]._cells[0]
+        origin_cell = table.columns[7]._cells[0]
         self.assertIsInstance(name_cell, Text)
         self.assertEqual(name_cell.plain, "● GPU-jupyterlab")
         self.assertEqual(str(name_cell.style), "bold green")
         self.assertIsInstance(state_cell, Text)
         self.assertEqual(state_cell.plain, "RUNNING")
         self.assertEqual(str(state_cell.style), "bold green")
+        self.assertEqual(port_cell, "56793")
         self.assertIsInstance(origin_cell, Text)
         self.assertEqual(origin_cell.plain, "CLI-managed, connected")
         self.assertEqual(str(origin_cell.style), "bold green")

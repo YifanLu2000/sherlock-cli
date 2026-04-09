@@ -176,6 +176,29 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(any("squeue -u" in command for command in commands))
             self.assertTrue(any("scontrol show job -o 4321" in command for command in commands))
 
+    def test_connect_job_uses_recorded_port_without_waiting_for_logs(self):
+        with TemporaryDirectory() as tmpdir:
+            service, _session_factory = self.make_service(tmpdir)
+            service.state.record_submission(
+                job_id="4321",
+                job_name="GPU-jupyterlab",
+                preset_id="xiaojie-gpu",
+                notebook_dir="/oak/demo",
+                remote_port=56793,
+                remote_stdout="/home/demo/forward-util/GPU-jupyterlab-4321.out",
+                remote_stderr="/home/demo/forward-util/GPU-jupyterlab-4321.err",
+                remote_template="/home/demo/forward-util/GPU-jupyterlab.sbatch",
+            )
+
+            with (
+                mock.patch.object(service, "_port_available", return_value=True),
+                mock.patch.object(service, "wait_for_jupyter", side_effect=AssertionError("should not wait")),
+            ):
+                info = service.connect_job("4321", open_browser=False)
+
+            self.assertEqual(info.port, 56793)
+            self.assertEqual(info.local_url, "http://localhost:56793/")
+
     def test_close_disposes_current_session(self):
         with TemporaryDirectory() as tmpdir:
             service, session_factory = self.make_service(tmpdir)
@@ -238,7 +261,7 @@ class ServiceTests(unittest.TestCase):
                 info = service.connect_job("4321", open_browser=False)
 
             self.assertIsInstance(info.local_port, int)
-            self.assertIn("token=abc123", info.local_url)
+            self.assertEqual(info.local_url, "http://localhost:56793/")
 
             # External job should now be adopted into state with tunnel info
             metadata = service.state.get("4321")
@@ -247,6 +270,19 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(metadata.remote_port, 56793)
             self.assertEqual(metadata.tunnel_pid, 7777)
             self.assertEqual(metadata.preset_id, "")
+
+    def test_connect_external_job_uses_preset_port_without_waiting_for_logs(self):
+        with TemporaryDirectory() as tmpdir:
+            service, _session_factory = self.make_service(tmpdir)
+
+            with (
+                mock.patch.object(service, "_port_available", return_value=True),
+                mock.patch.object(service, "wait_for_jupyter", side_effect=AssertionError("should not wait")),
+            ):
+                info = service.connect_job("4321", open_browser=False)
+
+            self.assertEqual(info.port, 56793)
+            self.assertEqual(info.local_url, "http://localhost:56793/")
 
 
 if __name__ == "__main__":

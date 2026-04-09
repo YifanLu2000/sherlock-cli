@@ -149,6 +149,7 @@ def build_jobs_table(jobs, *, title: str = "Jobs", selected_index: int | None = 
     table.add_column("Name")
     table.add_column("State", style="bold")
     table.add_column("Partition")
+    table.add_column("Port", no_wrap=True)
     table.add_column("Reason / Node")
     table.add_column("Elapsed")
     table.add_column("Origin")
@@ -165,6 +166,7 @@ def build_jobs_table(jobs, *, title: str = "Jobs", selected_index: int | None = 
             name_cell,
             state_cell,
             job.partition,
+            str(job.remote_port) if job.remote_port is not None else "-",
             job.reason_or_node,
             job.elapsed,
             origin_cell,
@@ -175,11 +177,18 @@ def build_jobs_table(jobs, *, title: str = "Jobs", selected_index: int | None = 
             style = "bold black on cyan" if index == selected_index else None
         table.add_row(*row, style=style)
     if not jobs:
-        empty_row = ["-", "No active jobs", "-", "-", "-", "-", "-"]
+        empty_row = ["-", "No active jobs", "-", "-", "-", "-", "-", "-"]
         if selected_index is not None:
             empty_row.insert(0, "")
         table.add_row(*empty_row)
     return table
+
+
+def render_jupyter_forwarding(jupyter) -> None:
+    console.print(
+        f"Forwarded remote port [cyan]{jupyter.port}[/cyan] to local port [cyan]{jupyter.local_port}[/cyan]."
+    )
+    console.print(f"Open: [green]{jupyter.local_url}[/green]")
 
 
 def render_jobs_table(jobs, *, title: str = "Jobs", selected_index: int | None = None):
@@ -576,7 +585,7 @@ def run_new(service: SherlockService, args) -> int:
         console.print(f"Final watch state: [bold]{status.state}[/bold]")
     if status and status.state == "RUNNING":
         jupyter = service.connect_job(job_id, open_browser=not args.no_browser)
-        console.print(f"Forwarded to [green]{jupyter.local_url}[/green]")
+        render_jupyter_forwarding(jupyter)
     return 0
 
 
@@ -847,7 +856,7 @@ def interactive_menu(service: RemoteService) -> int | str:
                     should_pause = False
                     continue
                 info = service.connect_job(target.job_id, open_browser=True)
-                console.print(f"Forwarded to [green]{info.local_url}[/green]")
+                render_jupyter_forwarding(info)
             elif action in {"w", "watch"}:
                 target = choose_job(jobs, action_label="Watch")
                 if target is None:
@@ -912,7 +921,7 @@ def main(argv: list[str] | None = None) -> int:
                 return run_new(service, args)
             if args.command == "connect":
                 info = service.connect_job(args.job, open_browser=not args.no_browser)
-                console.print(f"Forwarded to [green]{info.local_url}[/green]")
+                render_jupyter_forwarding(info)
                 return 0
             if args.command == "watch":
                 status = service.watch_job(args.job, connect_on_run=args.connect_on_run, console=console)

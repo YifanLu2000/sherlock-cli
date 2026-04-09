@@ -96,6 +96,7 @@ class JobInfo:
     elapsed: str
     origin: str
     connected: bool = False
+    remote_port: int | None = None
 
 
 @dataclass
