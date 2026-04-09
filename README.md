@@ -36,9 +36,10 @@ Then create your user config:
 
 ```bash
 sherlock-cli setup sherlock
+sherlock-cli setup marlowe
 ```
 
-The setup flow prompts for values such as your cluster username, notification email, and default notebook directory, then writes a user-specific config to `~/.config/sherlock-cli/sherlock.toml`.
+The setup flow prompts for values such as your cluster username, notification email, and default notebook directory, then writes a user-specific config to `~/.config/sherlock-cli/<cluster>.toml`.
 
 That installs these commands:
 
