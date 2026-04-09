@@ -32,6 +32,14 @@ Install from source:
 python3 -m pip install -e .
 ```
 
+Then create your user config:
+
+```bash
+sherlock-cli setup sherlock
+```
+
+The setup flow prompts for values such as your cluster username, notification email, and default notebook directory, then writes a user-specific config to `~/.config/sherlock-cli/sherlock.toml`.
+
 That installs these commands:
 
 - `sherlock-cli`
@@ -45,11 +53,17 @@ You can also use the helper installer:
 ./install.sh marlowe
 ```
 
-`install.sh` installs the package from the current repo and immediately runs `remote setup --full` for the chosen cluster config.
+`install.sh` installs the package, runs `sherlock-cli setup` for the chosen cluster, and then runs `remote setup --full` with the generated user config.
 
 ## Quick Start
 
 ### Sherlock: submit a Jupyter job
+
+If this is your first time using the CLI on Sherlock, run:
+
+```bash
+sherlock-cli setup sherlock
+```
 
 Submit from a preset:
 
@@ -87,18 +101,24 @@ Cancel a job:
 sherlock-cli kill 123456
 ```
 
-### Marlowe: use the bundled Marlowe config
+### Marlowe: use the Marlowe config
 
-The default config is Sherlock. To use Marlowe, pass `--config marlowe_presets.toml`:
+Create the Marlowe user config first:
 
 ```bash
-sherlock-cli --config marlowe_presets.toml new --preset marlowe-batch-gpu
+sherlock-cli setup marlowe
+```
+
+The default config is Sherlock. To use Marlowe, pass `--config ~/.config/sherlock-cli/marlowe.toml`:
+
+```bash
+sherlock-cli --config ~/.config/sherlock-cli/marlowe.toml new --preset marlowe-batch-gpu
 ```
 
 You can do the same for any other subcommand:
 
 ```bash
-sherlock-cli --config marlowe_presets.toml list
+sherlock-cli --config ~/.config/sherlock-cli/marlowe.toml list
 ```
 
 ### Remote compute-node session
@@ -384,7 +404,7 @@ sherlock-cli remote clean
 
 ## Configuration and Presets
 
-By default the CLI reads `sherlock_presets.toml`. You can switch configs with:
+By default the CLI reads `~/.config/sherlock-cli/sherlock.toml` when it exists, and otherwise falls back to the bundled `sherlock_presets.toml`. You can switch configs with:
 
 ```bash
 sherlock-cli --config /path/to/config.toml list
@@ -427,8 +447,8 @@ marlowe-compute ...
 
 They are convenience entrypoints for remote-session workflows:
 
-- `sherlock-compute ...` forwards to `sherlock-cli --config sherlock_presets.toml remote ...`
-- `marlowe-compute ...` forwards to `sherlock-cli --config marlowe_presets.toml remote ...`
+- `sherlock-compute ...` forwards to `sherlock-cli --config ~/.config/sherlock-cli/sherlock.toml remote ...` when that file exists, otherwise it falls back to the bundled Sherlock preset file
+- `marlowe-compute ...` forwards to `sherlock-cli --config ~/.config/sherlock-cli/marlowe.toml remote ...` when that file exists, otherwise it falls back to the bundled Marlowe preset file
 
 The main documentation path is still `sherlock-cli`.
 

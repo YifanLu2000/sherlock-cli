@@ -82,6 +82,13 @@ class StateStore:
     def clear_tunnel(self, job_id: str) -> None:
         self.update_tunnel(job_id, None, None, None)
 
+    def update_jupyter_url(self, job_id: str, jupyter_url: str) -> None:
+        metadata = self._data.jobs.get(job_id)
+        if not metadata:
+            return
+        metadata.jupyter_url = jupyter_url
+        self.save()
+
     def record_submission(
         self,
         job_id: str,

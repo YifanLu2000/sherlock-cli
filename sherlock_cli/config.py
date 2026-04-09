@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 from pathlib import Path
 
 try:
@@ -15,29 +17,127 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _load_raw_config(path: Path) -> dict:
+    with path.open("rb") as handle:
+        return tomllib.load(handle)
+
+
 def _expand_path(value: str) -> Path:
     return Path(os.path.expanduser(value)).resolve()
 
 
+def user_config_dir() -> Path:
+    return _expand_path("~/.config/sherlock-cli")
+
+
+def default_user_config_path(resource: str) -> Path:
+    return user_config_dir() / f"{resource}.toml"
+
+
+def bundled_config_path(resource: str) -> Path:
+    return _repo_root() / f"{resource}_presets.toml"
+
+
+def is_bundled_config_path(path: Path) -> bool:
+    return path.resolve().parent == _repo_root() and path.name.endswith("_presets.toml")
+
+
+def resolve_resource_config_path(resource: str) -> Path:
+    user_path = default_user_config_path(resource)
+    if user_path.exists():
+        return user_path
+    return bundled_config_path(resource)
+
+
+def find_config_path(cluster: str) -> Path | None:
+    wanted = cluster.strip().lower()
+    for name, path in discover_configs():
+        raw = _load_raw_config(path)
+        resource = raw.get("connection", {}).get("resource", "")
+        aliases = {
+            name.lower(),
+            resource.lower(),
+            path.stem.lower(),
+            path.stem.removesuffix("_presets").lower(),
+        }
+        if wanted in aliases:
+            return path
+    return None
+
+
 def discover_configs() -> list[tuple[str, Path]]:
-    """Return ``(cluster_name, config_path)`` for every ``*_presets.toml`` in the repo root."""
-    repo_root = _repo_root()
-    results: list[tuple[str, Path]] = []
-    for path in sorted(repo_root.glob("*_presets.toml")):
-        with path.open("rb") as fh:
-            raw = tomllib.load(fh)
-        name = raw.get("connection", {}).get("name", path.stem)
-        results.append((name, path))
-    return results
+    """Return available configs, preferring user overrides over bundled presets."""
+    configs_by_resource: dict[str, tuple[str, Path]] = {}
+
+    for path in sorted(_repo_root().glob("*_presets.toml")):
+        raw = _load_raw_config(path)
+        connection = raw.get("connection", {})
+        resource = connection.get("resource", path.stem)
+        name = connection.get("name", path.stem)
+        configs_by_resource[resource] = (name, path)
+
+    config_dir = user_config_dir()
+    if config_dir.exists():
+        for path in sorted(config_dir.glob("*.toml")):
+            raw = _load_raw_config(path)
+            connection = raw.get("connection", {})
+            resource = connection.get("resource", path.stem)
+            name = connection.get("name", path.stem)
+            configs_by_resource[resource] = (name, path)
+
+    return sorted(configs_by_resource.values(), key=lambda item: item[0].lower())
+
+
+def resolve_config_path(config_path: str | None = None) -> Path:
+    if config_path:
+        return Path(config_path).expanduser()
+
+    env_config = os.environ.get("SHERLOCK_CONFIG")
+    if env_config:
+        return Path(env_config).expanduser()
+
+    return resolve_resource_config_path("sherlock")
+
+
+def _toml_quote(value: str) -> str:
+    return json.dumps(value)
+
+
+def write_config(
+    source_path: Path,
+    output_path: Path,
+    *,
+    forward_username: str,
+    email: str,
+    default_notebook_dir: str,
+) -> Path:
+    content = source_path.read_text()
+    replacements = {
+        "forward_username": forward_username,
+        "email": email,
+        "default_notebook_dir": default_notebook_dir,
+    }
+    for key, value in replacements.items():
+        pattern = rf"(^\s*{re.escape(key)}\s*=\s*)\".*?\""
+        content, count = re.subn(
+            pattern,
+            lambda match: f"{match.group(1)}{_toml_quote(value)}",
+            content,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if count != 1:
+            raise ValueError(f"Could not update {key} in {source_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content)
+    return output_path.resolve()
 
 
 def load_config(config_path: str | None = None) -> AppConfig:
     repo_root = _repo_root()
-    selected_path = Path(
-        config_path or os.environ.get("SHERLOCK_CONFIG") or repo_root / "sherlock_presets.toml"
-    ).expanduser()
-    with selected_path.open("rb") as handle:
-        raw = tomllib.load(handle)
+    selected_path = resolve_config_path(config_path)
+    raw = _load_raw_config(selected_path)
 
     connection_raw = raw["connection"]
     connection = ConnectionConfig(

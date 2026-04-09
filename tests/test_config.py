@@ -1,8 +1,10 @@
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 
-from sherlock_cli.config import load_config
+from sherlock_cli.config import discover_configs, load_config, write_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -66,6 +68,42 @@ account = "demo-account"
             self.assertEqual(config.presets["demo"].account, "demo-account")
             self.assertEqual(config.remote.compute_host_alias, "demo-compute")
             self.assertEqual(config.remote_default_profile_id, "cpu")
+
+    def test_load_config_prefers_user_override_for_default_sherlock(self):
+        with TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / ".config" / "sherlock-cli" / "sherlock.toml"
+            source = Path(__file__).resolve().parent.parent / "sherlock_presets.toml"
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                write_config(
+                    source,
+                    target,
+                    forward_username="override-user",
+                    email="override-user@stanford.edu",
+                    default_notebook_dir="/oak/override-user",
+                )
+                config = load_config()
+            self.assertEqual(config.connection.forward_username, "override-user")
+            self.assertEqual(config.connection.email, "override-user@stanford.edu")
+            self.assertEqual(config.connection.default_notebook_dir, "/oak/override-user")
+            self.assertEqual(config.config_path, target.resolve())
+
+    def test_discover_configs_prefers_user_override(self):
+        with TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / ".config" / "sherlock-cli" / "sherlock.toml"
+            source = Path(__file__).resolve().parent.parent / "sherlock_presets.toml"
+            with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                write_config(
+                    source,
+                    target,
+                    forward_username="override-user",
+                    email="override-user@stanford.edu",
+                    default_notebook_dir="/oak/override-user",
+                )
+                configs = discover_configs()
+            sherlock_path = dict(configs)["Sherlock"]
+            self.assertEqual(sherlock_path, target.resolve())
 
 
 if __name__ == "__main__":

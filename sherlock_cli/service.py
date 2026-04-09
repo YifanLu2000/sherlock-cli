@@ -240,8 +240,11 @@ class SherlockService:
         )
         jobs = parse_squeue_jobs(output, self.state.managed_job_ids())
         for job in jobs:
+            metadata = self.state.get(job.job_id)
             job.connected = job.job_id in connected_job_ids
-            job.remote_port = self._resolve_remote_port(job.name, self.state.get(job.job_id))
+            job.remote_port = self._resolve_remote_port(job.name, metadata)
+            if metadata and job.state == "RUNNING":
+                self._cache_jupyter_url(job.job_id, metadata)
         jobs.sort(key=lambda job: (job.state != "RUNNING", job.job_id))
         return jobs
 
@@ -490,6 +493,18 @@ class SherlockService:
         if len(matching_ports) == 1:
             return matching_ports.pop()
         return None
+
+    def _cache_jupyter_url(self, job_id: str, metadata: JobMetadata) -> None:
+        if metadata.jupyter_url:
+            return
+        logs = []
+        if metadata.remote_stdout:
+            logs.append(self._read_remote_file(metadata.remote_stdout, 60))
+        if metadata.remote_stderr:
+            logs.append(self._read_remote_file(metadata.remote_stderr, 60))
+        info = parse_jupyter_info("\n".join(logs))
+        if info and info.url:
+            self.state.update_jupyter_url(job_id, info.url)
 
     @staticmethod
     def _build_direct_jupyter_info(remote_port: int, metadata=None) -> JupyterInfo:

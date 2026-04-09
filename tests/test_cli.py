@@ -1,3 +1,4 @@
+import os
 from unittest import mock
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from sherlock_cli.cli import (
     build_jobs_table,
     choose_cluster,
     choose_job,
+    main,
     select_remote_profile,
     select_preset,
     should_exit_on_interrupt,
@@ -225,6 +227,25 @@ class CliTests(unittest.TestCase):
                 mock.patch("sherlock_cli.cli.Live", DummyLive),
             ):
                 self.assertIsNone(select_remote_profile(service))
+
+    def test_setup_command_writes_user_config(self):
+        with TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / ".config" / "sherlock-cli" / "sherlock.toml"
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False),
+                mock.patch(
+                    "sherlock_cli.cli.Prompt.ask",
+                    side_effect=["demo-user", "demo-user@stanford.edu", "/oak/demo-user"],
+                ),
+            ):
+                exit_code = main(["setup", "sherlock"])
+
+            self.assertEqual(exit_code, 0)
+            config = load_config(str(target))
+            self.assertEqual(config.connection.forward_username, "demo-user")
+            self.assertEqual(config.connection.email, "demo-user@stanford.edu")
+            self.assertEqual(config.connection.default_notebook_dir, "/oak/demo-user")
 
 
 if __name__ == "__main__":

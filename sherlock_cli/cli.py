@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import select
 import sys
 import termios
@@ -9,6 +10,7 @@ import time
 import tty
 from dataclasses import dataclass
 from dataclasses import replace
+from pathlib import Path
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -17,7 +19,14 @@ from rich.spinner import Spinner
 from rich.text import Text
 from rich.table import Table
 
-from .config import discover_configs, load_config
+from .config import (
+    default_user_config_path,
+    discover_configs,
+    find_config_path,
+    is_bundled_config_path,
+    load_config,
+    write_config,
+)
 from .models import JobLogs, Preset, RemoteProfile, SubmissionRequest
 from .remote import RemoteService
 from .service import SherlockError, SherlockService
@@ -72,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="Path to a cluster config TOML")
 
     subparsers = parser.add_subparsers(dest="command")
+
+    setup_parser = subparsers.add_parser("setup", help="Create or update a user config")
+    setup_parser.add_argument("cluster", nargs="?", help="Cluster name or resource id")
+    setup_parser.add_argument("--output", help="Write the configured TOML to this path")
 
     list_parser = subparsers.add_parser("list", help="List pending and running jobs")
     list_parser.add_argument("--logs", action="store_true", help="Also show log paths")
@@ -139,6 +152,72 @@ def make_remote_service(config_path: str | None = None) -> RemoteService:
 
 def cluster_name(service: SherlockService) -> str:
     return service.config.connection.name
+
+
+def suggest_notebook_dir(path: str, old_username: str, new_username: str) -> str:
+    if not path or not old_username or old_username == new_username:
+        return path
+    return re.sub(re.escape(old_username), new_username, path, flags=re.IGNORECASE)
+
+
+def resolve_setup_source(args) -> Path:
+    if args.config:
+        return Path(args.config).expanduser()
+    if args.cluster:
+        config_path = find_config_path(args.cluster)
+        if config_path is None:
+            raise SherlockError(f"Unknown cluster: {args.cluster}")
+        return config_path
+
+    configs = discover_configs()
+    if not configs:
+        raise SherlockError("No *_presets.toml config files found.")
+    if len(configs) == 1:
+        return configs[0][1]
+    chosen = choose_cluster(configs)
+    if chosen is None:
+        raise SherlockError("No cluster selected.")
+    return chosen[1]
+
+
+def resolve_setup_output_path(args, config) -> Path:
+    if args.output:
+        return Path(args.output).expanduser()
+    if args.config and not is_bundled_config_path(config.config_path):
+        return config.config_path
+    return default_user_config_path(config.connection.resource)
+
+
+def run_setup(args) -> int:
+    source_path = resolve_setup_source(args)
+    config = load_config(str(source_path))
+    output_path = resolve_setup_output_path(args, config)
+
+    username_default = os.environ.get("USER") or config.connection.forward_username
+    email_domain = config.connection.email.partition("@")[2]
+    email_default = config.connection.email
+    if email_domain:
+        email_default = f"{username_default}@{email_domain}"
+    notebook_dir_default = suggest_notebook_dir(
+        config.connection.default_notebook_dir,
+        config.connection.forward_username,
+        username_default,
+    )
+
+    console.print(f"Configuring [bold]{config.connection.name}[/bold].")
+    forward_username = Prompt.ask("Cluster username", default=username_default).strip()
+    email = Prompt.ask("Notification email", default=f"{forward_username}@{email_domain}" if email_domain else email_default).strip()
+    default_notebook_dir = Prompt.ask("Default notebook dir", default=notebook_dir_default).strip()
+
+    written_path = write_config(
+        source_path,
+        output_path,
+        forward_username=forward_username,
+        email=email,
+        default_notebook_dir=default_notebook_dir,
+    )
+    console.print(f"Wrote config to [green]{written_path}[/green].")
+    return 0
 
 
 def build_jobs_table(jobs, *, title: str = "Jobs", selected_index: int | None = None):
@@ -902,6 +981,17 @@ def interactive_menu(service: RemoteService) -> int | str:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "setup":
+        try:
+            return run_setup(args)
+        except SherlockError as exc:
+            console.print(f"[red]{exc}[/red]")
+            return 1
+        except KeyboardInterrupt:
+            console.print()
+            console.print("[yellow]Interrupted.[/yellow]")
+            return 130
 
     # Non-interactive subcommands: use a single service (--config or default).
     if args.command is not None:
