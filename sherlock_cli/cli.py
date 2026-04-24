@@ -8,7 +8,7 @@ import sys
 import termios
 import time
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace
 from pathlib import Path
 
@@ -27,9 +27,9 @@ from .config import (
     load_config,
     write_config,
 )
-from .models import JobLogs, Preset, RemoteProfile, SubmissionRequest
+from .models import JobInfo, JobLogs, Preset, RemoteProfile, SubmissionRequest
 from .remote import RemoteService
-from .service import SherlockError, SherlockService
+from .service import PersistentSessionLostError, SherlockError, SherlockService
 from .state import StateStore
 
 
@@ -54,12 +54,23 @@ REMOTE_ACTIONS = [
     ("n", "Clean"),
     ("b", "Back"),
 ]
+MULTI_CLUSTER_MENU_ACTIONS = [action for action in MENU_ACTIONS if action[0] != "s"]
 INTERRUPT_EXIT_WINDOW_SECONDS = 2.0
+DISCONNECT_SENTINEL = "__disconnect__"
 
 
 @dataclass
 class InterruptTracker:
     last_interrupt_at: float | None = None
+
+
+@dataclass
+class ClusterContext:
+    name: str
+    config_path: Path
+    service: RemoteService
+    jobs: list[JobInfo] = field(default_factory=list)
+    load_error: str | None = None
 
 
 def should_exit_on_interrupt(
@@ -107,6 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
     connect_parser = subparsers.add_parser("connect", help="Forward a running Jupyter job to localhost")
     connect_parser.add_argument("job", help="Job id or job name")
     connect_parser.add_argument("--no-browser", action="store_true")
+    connect_parser.add_argument(
+        "--local-port",
+        type=int,
+        help="Local port for SSH forwarding (defaults to the remote Jupyter port)",
+    )
 
     watch_parser = subparsers.add_parser("watch", help="Watch a job until it starts or exits")
     watch_parser.add_argument("job", help="Job id or job name")
@@ -140,18 +156,191 @@ def build_parser() -> argparse.ArgumentParser:
 
 def make_service(config_path: str | None = None) -> SherlockService:
     config = load_config(config_path)
-    state = StateStore(config.state_path)
+    state = StateStore(config.state_path, config.connection.resource)
     return SherlockService(config, state)
 
 
 def make_remote_service(config_path: str | None = None) -> RemoteService:
     config = load_config(config_path)
-    state = StateStore(config.state_path)
+    state = StateStore(config.state_path, config.connection.resource)
     return RemoteService(config, state)
 
 
 def cluster_name(service: SherlockService) -> str:
     return service.config.connection.name
+
+
+def cluster_aliases(service: SherlockService) -> set[str]:
+    config_path = service.config.config_path
+    return {
+        service.config.connection.name.lower(),
+        service.config.connection.resource.lower(),
+        config_path.stem.lower(),
+        config_path.stem.removesuffix("_presets").lower(),
+    }
+
+
+def build_cluster_contexts() -> list[ClusterContext]:
+    contexts: list[ClusterContext] = []
+    for name, config_path in discover_configs():
+        service = make_remote_service(str(config_path))
+        contexts.append(ClusterContext(name=name, config_path=Path(config_path), service=service))
+    return contexts
+
+
+def close_cluster_contexts(contexts: list[ClusterContext]) -> None:
+    for context in contexts:
+        context.service.close()
+
+
+def refresh_cluster_context(context: ClusterContext, *, ensure_connected: bool = False) -> None:
+    try:
+        if ensure_connected:
+            context.service.ensure_connected()
+        context.jobs = context.service.list_jobs()
+        context.load_error = None
+    except SherlockError as exc:
+        context.jobs = []
+        context.load_error = str(exc)
+        context.service.close()
+
+
+def refresh_all_cluster_contexts(contexts: list[ClusterContext], *, ensure_connected: bool = False) -> None:
+    for context in contexts:
+        refresh_cluster_context(context, ensure_connected=ensure_connected)
+
+
+def split_qualified_target(target: str) -> tuple[str | None, str]:
+    if ":" not in target:
+        return None, target
+    prefix, value = target.split(":", 1)
+    if not prefix or not value:
+        raise SherlockError(f"Invalid target '{target}'. Use cluster:job or a bare job identifier.")
+    return prefix, value
+
+
+def find_cluster_context(contexts: list[ClusterContext], alias: str) -> ClusterContext:
+    wanted = alias.strip().lower()
+    for context in contexts:
+        if wanted in cluster_aliases(context.service):
+            return context
+    raise SherlockError(f"Unknown cluster '{alias}'.")
+
+
+def resolve_job_from_list(jobs: list[JobInfo], target: str) -> JobInfo | None:
+    exact_id = [job for job in jobs if job.job_id == target]
+    if exact_id:
+        return exact_id[0]
+    exact_name = [job for job in jobs if job.name == target]
+    if len(exact_name) == 1:
+        return exact_name[0]
+    if len(exact_name) > 1:
+        raise SherlockError(f"Multiple active jobs match name '{target}'. Use a job id.")
+    return None
+
+
+def resolve_cluster_job_target(
+    contexts: list[ClusterContext],
+    target: str,
+    *,
+    running_only: bool = False,
+) -> tuple[ClusterContext, JobInfo]:
+    alias, raw_target = split_qualified_target(target)
+    candidate_contexts = [find_cluster_context(contexts, alias)] if alias else contexts
+    matches: list[tuple[ClusterContext, JobInfo]] = []
+    errors: list[str] = []
+    for context in candidate_contexts:
+        try:
+            jobs = context.service.list_jobs()
+        except SherlockError as exc:
+            context.load_error = str(exc)
+            errors.append(f"{context.name}: {exc}")
+            continue
+        context.jobs = jobs
+        context.load_error = None
+        visible_jobs = [job for job in jobs if job.state == "RUNNING"] if running_only else jobs
+        match = resolve_job_from_list(visible_jobs, raw_target)
+        if match is not None:
+            matches.append((context, match))
+    if not matches:
+        if errors and alias:
+            raise SherlockError(errors[0])
+        kind = "running job" if running_only else "active job"
+        raise SherlockError(f"{kind.capitalize()} '{raw_target}' not found.")
+    if len(matches) == 1:
+        return matches[0]
+    available = ", ".join(sorted(context.name for context, _job in matches))
+    raise SherlockError(
+        f"Target '{raw_target}' matched multiple clusters: {available}. Use cluster:job or --config."
+    )
+
+
+def choose_cluster_job(contexts: list[ClusterContext], *, action_label: str) -> tuple[ClusterContext, JobInfo] | None:
+    options: list[tuple[ClusterContext, JobInfo]] = []
+    for context in contexts:
+        for job in context.jobs:
+            options.append((context, job))
+    if not options:
+        raise SherlockError(f"No jobs available for {action_label.lower()}.")
+    if not sys.stdin.isatty():
+        table = Table(title=f"Select Job To {action_label}")
+        table.add_column("Cluster")
+        table.add_column("Job ID", style="cyan")
+        table.add_column("Name")
+        for context, job in options:
+            table.add_row(context.name, job.job_id, job.name)
+        console.print(table)
+        choices = [f"{context.service.config.connection.resource}:{job.job_id}" for context, job in options]
+        selected = Prompt.ask("Job", choices=choices, default=choices[0])
+        cluster_alias, job_id = selected.split(":", 1)
+        context = find_cluster_context(contexts, cluster_alias)
+        return context, next(job for candidate_context, job in options if candidate_context is context and job.job_id == job_id)
+
+    selected_index = 0
+
+    def build_view() -> Group:
+        table = Table(title=f"Select Job To {action_label}")
+        table.add_column("", no_wrap=True, width=2)
+        table.add_column("Cluster")
+        table.add_column("Job ID", style="cyan")
+        table.add_column("Name")
+        table.add_column("State", style="bold")
+        for index, (context, job) in enumerate(options):
+            style = "bold black on cyan" if index == selected_index else None
+            table.add_row(
+                ">" if index == selected_index else "",
+                context.name,
+                job.job_id,
+                job.name,
+                job.state,
+                style=style,
+            )
+        help_text = Text("Use up/down arrows or j/k, Enter to select, Esc to go back.", style="dim")
+        return Group(table, help_text)
+
+    with Live(build_view(), console=console, auto_refresh=False) as live:
+        while True:
+            key = _read_raw_key()
+            if key == "\x1b[B" or key.lower() == "j":
+                selected_index = (selected_index + 1) % len(options)
+                live.update(build_view(), refresh=True)
+            elif key == "\x1b[A" or key.lower() == "k":
+                selected_index = (selected_index - 1) % len(options)
+                live.update(build_view(), refresh=True)
+            elif key == ESC_KEY:
+                return None
+            elif key in {"\r", "\n"}:
+                return options[selected_index]
+
+
+def resolve_remote_session_context(contexts: list[ClusterContext]) -> ClusterContext:
+    matches = [context for context in contexts if context.service.state.get_remote_session() is not None]
+    if not matches:
+        raise SherlockError("No remote session info found in any configured cluster.")
+    if len(matches) == 1:
+        return matches[0]
+    names = ", ".join(sorted(context.name for context in matches))
+    raise SherlockError(f"Multiple clusters have remote sessions: {names}. Use --config.")
 
 
 def suggest_notebook_dir(path: str, old_username: str, new_username: str) -> str:
@@ -309,6 +498,164 @@ def build_main_menu_view(jobs, selected_index: int):
     )
 
 
+def build_multi_cluster_action_selector(selected_index: int):
+    text = build_shortcut_selector("Actions", MULTI_CLUSTER_MENU_ACTIONS, selected_index)
+    help_text = Text(
+        "Use up/down to switch clusters, left/right to switch actions, then Enter.",
+        style="dim",
+    )
+    return Group(text, help_text)
+
+
+def build_cluster_jobs_table(context: ClusterContext, *, active: bool = False) -> Table:
+    title = f"{context.name} Jobs"
+    if context.load_error:
+        table = Table(title=title)
+        table.add_column("Job ID", style="cyan", no_wrap=True)
+        table.add_column("Name")
+        table.add_column("State", style="bold")
+        table.add_column("Partition")
+        table.add_column("Port", no_wrap=True)
+        table.add_column("Reason / Node")
+        table.add_column("Elapsed")
+        table.add_column("Origin")
+        table.add_row(
+            "-",
+            "Cluster unavailable",
+            Text("ERROR", style="bold red"),
+            "-",
+            "-",
+            context.load_error,
+            "-",
+            "-",
+        )
+    else:
+        table = build_jobs_table(context.jobs, title=title)
+    if active:
+        table.border_style = "cyan"
+        table.title_style = "bold cyan"
+    return table
+
+
+def build_multi_cluster_dashboard(contexts: list[ClusterContext], *, active_index: int | None = None):
+    if not contexts:
+        empty = Table(title="Jobs")
+        empty.add_column("Job ID", style="cyan", no_wrap=True)
+        empty.add_column("Name")
+        empty.add_column("State", style="bold")
+        empty.add_column("Partition")
+        empty.add_column("Port", no_wrap=True)
+        empty.add_column("Reason / Node")
+        empty.add_column("Elapsed")
+        empty.add_column("Origin")
+        empty.add_row("-", "No configured clusters", "-", "-", "-", "-", "-", "-")
+        return empty
+    return Group(
+        *[
+            build_cluster_jobs_table(context, active=active_index is not None and index == active_index)
+            for index, context in enumerate(contexts)
+        ]
+    )
+
+
+def build_multi_cluster_jobs_table(
+    contexts: list[ClusterContext],
+    *,
+    title: str = "Jobs",
+    active_index: int | None = None,
+) -> Table:
+    table = Table(title=title)
+    table.add_column("Cluster", style="bold", no_wrap=True)
+    table.add_column("Job ID", style="cyan", no_wrap=True)
+    table.add_column("Name")
+    table.add_column("State", style="bold")
+    table.add_column("Partition")
+    table.add_column("Port", no_wrap=True)
+    table.add_column("Reason / Node")
+    table.add_column("Elapsed")
+    table.add_column("Origin")
+
+    row_count = 0
+    for index, context in enumerate(contexts):
+        row_style = "bold black on cyan" if active_index is not None and index == active_index else None
+        header_style = "bold cyan" if index == active_index else "bold white"
+        table.add_row(
+            Text(context.name, style=header_style),
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            style=row_style,
+        )
+        row_count += 1
+        if context.load_error:
+            table.add_row(
+                "",
+                "-",
+                "Cluster unavailable",
+                Text("ERROR", style="bold red"),
+                "-",
+                "-",
+                context.load_error,
+                "-",
+                "-",
+                style=row_style,
+            )
+            row_count += 1
+            continue
+        if not context.jobs:
+            table.add_row(
+                "",
+                "-",
+                "No active jobs",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                style=row_style,
+            )
+            row_count += 1
+            continue
+        for job in context.jobs:
+            name_cell = Text(job.name)
+            state_cell = Text(job.state)
+            origin_cell = Text(job.origin)
+            if job.connected:
+                name_cell = Text(f"● {job.name}", style="bold green")
+                state_cell = Text(job.state, style="bold green")
+                origin_cell = Text(f"{job.origin}, connected", style="bold green")
+            table.add_row(
+                "",
+                job.job_id,
+                name_cell,
+                state_cell,
+                job.partition,
+                str(job.remote_port) if job.remote_port is not None else "-",
+                job.reason_or_node,
+                job.elapsed,
+                origin_cell,
+                style=row_style,
+            )
+            row_count += 1
+
+    if row_count == 0:
+        table.add_row("-", "-", "No configured clusters", "-", "-", "-", "-", "-", "-")
+    return table
+
+
+def build_multi_cluster_main_view(contexts: list[ClusterContext], active_index: int, action_index: int):
+    return Group(
+        build_multi_cluster_dashboard(contexts, active_index=active_index),
+        build_multi_cluster_action_selector(action_index),
+    )
+
+
 def build_job_selector_view(jobs, selected_index: int, *, action_label: str):
     help_text = Text("Use up/down arrows or j/k, Enter to select, Esc to go back.", style="dim")
     return Group(
@@ -401,7 +748,10 @@ def choose_action(jobs, *, refresh_callback=None) -> str:
             key = _read_raw_key(timeout=AUTO_REFRESH_SECONDS)
             if key is None:
                 if refresh_callback:
-                    jobs = refresh_callback()
+                    try:
+                        jobs = refresh_callback()
+                    except PersistentSessionLostError:
+                        return DISCONNECT_SENTINEL
                     live.update(build_main_menu_view(jobs, selected_index), refresh=True)
                 continue
             if key == "\x1b[C":
@@ -422,6 +772,48 @@ def choose_action(jobs, *, refresh_callback=None) -> str:
                     live.update(build_main_menu_view(jobs, selected_index), refresh=True)
 
 
+def choose_multi_cluster_action(
+    contexts: list[ClusterContext],
+    *,
+    active_index: int,
+    refresh_callback=None,
+) -> tuple[str, int]:
+    if not sys.stdin.isatty():
+        console.print(build_multi_cluster_main_view(contexts, active_index, 0))
+        choices = [key for key, _label in MULTI_CLUSTER_MENU_ACTIONS]
+        action = Prompt.ask("Choose action", choices=choices, default="r").lower()
+        return action, active_index
+
+    action_index = 0
+    with Live(build_multi_cluster_main_view(contexts, active_index, action_index), console=console, auto_refresh=False) as live:
+        while True:
+            key = _read_raw_key(timeout=AUTO_REFRESH_SECONDS)
+            if key is None:
+                if refresh_callback:
+                    refresh_callback()
+                    live.update(build_multi_cluster_main_view(contexts, active_index, action_index), refresh=True)
+                continue
+            if key == "\x1b[B" or key.lower() == "j":
+                active_index = (active_index + 1) % len(contexts)
+                live.update(build_multi_cluster_main_view(contexts, active_index, action_index), refresh=True)
+            elif key == "\x1b[A" or key.lower() == "k":
+                active_index = (active_index - 1) % len(contexts)
+                live.update(build_multi_cluster_main_view(contexts, active_index, action_index), refresh=True)
+            elif key == "\x1b[C" or key.lower() == "l":
+                action_index = (action_index + 1) % len(MULTI_CLUSTER_MENU_ACTIONS)
+                live.update(build_multi_cluster_main_view(contexts, active_index, action_index), refresh=True)
+            elif key == "\x1b[D" or key.lower() == "h":
+                action_index = (action_index - 1) % len(MULTI_CLUSTER_MENU_ACTIONS)
+                live.update(build_multi_cluster_main_view(contexts, active_index, action_index), refresh=True)
+            elif key in {"\r", "\n"}:
+                return MULTI_CLUSTER_MENU_ACTIONS[action_index][0], active_index
+            else:
+                lowered = key.lower()
+                for shortcut, _label in MULTI_CLUSTER_MENU_ACTIONS:
+                    if lowered == shortcut:
+                        return shortcut, active_index
+
+
 def choose_remote_action(service: RemoteService, jobs, *, refresh_callback=None) -> str | None:
     if not sys.stdin.isatty():
         console.print(build_remote_menu_view(service, jobs, 0))
@@ -434,7 +826,10 @@ def choose_remote_action(service: RemoteService, jobs, *, refresh_callback=None)
             key = _read_raw_key(timeout=AUTO_REFRESH_SECONDS)
             if key is None:
                 if refresh_callback:
-                    jobs = refresh_callback()
+                    try:
+                        jobs = refresh_callback()
+                    except PersistentSessionLostError:
+                        return DISCONNECT_SENTINEL
                     live.update(build_remote_menu_view(service, jobs, selected_index), refresh=True)
                 continue
             if key == ESC_KEY:
@@ -452,6 +847,27 @@ def choose_remote_action(service: RemoteService, jobs, *, refresh_callback=None)
                 for shortcut, _label in REMOTE_ACTIONS:
                     if lowered == shortcut:
                         return shortcut
+
+
+def choose_disconnect_action(*, allow_switch: bool) -> str:
+    choices = ["r", "q"]
+    prompt = "Connection lost. Retry or quit"
+    if allow_switch:
+        choices.insert(1, "s")
+        prompt = "Connection lost. Retry, switch cluster, or quit"
+    return Prompt.ask(prompt, choices=choices, default="r").lower()
+
+
+def choose_remote_disconnect_action() -> str:
+    return Prompt.ask(
+        "Connection lost. Retry, go back, or quit",
+        choices=["r", "b", "q"],
+        default="r",
+    ).lower()
+
+
+def pause_for_continue() -> None:
+    console.input("Press Enter to continue: ")
 
 
 def choose_job(jobs, *, action_label: str):
@@ -668,6 +1084,23 @@ def run_new(service: SherlockService, args) -> int:
     return 0
 
 
+def prompt_local_connect_port(job: JobInfo) -> int | None:
+    if job.remote_port is not None:
+        return IntPrompt.ask("Local port", default=job.remote_port)
+    while True:
+        value = Prompt.ask("Local port (blank = remote port)", default="").strip()
+        if not value:
+            return None
+        try:
+            port = int(value)
+        except ValueError:
+            console.print("[red]Port must be an integer.[/red]")
+            continue
+        if 1 <= port <= 65535:
+            return port
+        console.print("[red]Port must be between 1 and 65535.[/red]")
+
+
 def choose_remote_job(service: RemoteService, target: str | None):
     if target:
         job = service.resolve_job(target)
@@ -745,40 +1178,51 @@ def run_remote(service: RemoteService, args) -> int:
     raise SherlockError(f"Unknown remote command: {args.remote_command}")
 
 
-def interactive_remote_menu(service: RemoteService) -> None:
+def interactive_remote_menu(service: RemoteService) -> int | None:
     while True:
-        jobs = service.list_jobs()
-        action = choose_remote_action(service, jobs, refresh_callback=service.list_jobs)
-        if action in {None, "b"}:
-            return
-        if action == "a":
-            target = choose_job([job for job in jobs if job.state == "RUNNING"], action_label="Attach Remote")
-            if target is None:
-                continue
-            session = service.attach(target.job_id)
-            render_remote_session(service, session)
-        elif action == "t":
-            profile = select_remote_profile(service)
-            if profile is None:
-                continue
-            session = service.start(profile.id)
-            render_remote_session(service, session)
-        elif action == "c":
-            session = service.connect_remote()
-            render_remote_session(service, session)
-        elif action == "s":
-            session = service.stop()
-            console.print(
-                f"Stopped remote session for job [cyan]{session.job_id}[/cyan] "
-                f"([bold]{session.session_type}[/bold])."
-            )
-        elif action == "u":
-            service.setup_full()
-            console.print(f"Local and remote setup complete for [bold]{cluster_name(service)}[/bold].")
-        elif action == "n":
-            service.clean()
-            console.print(f"Removed local SSH config for [bold]{service.compute_host_alias}[/bold].")
-        Prompt.ask("Press Enter to continue", default="")
+        try:
+            jobs = service.list_jobs()
+            action = choose_remote_action(service, jobs, refresh_callback=service.list_jobs)
+            if action == DISCONNECT_SENTINEL:
+                raise PersistentSessionLostError("Persistent SSH session disconnected.")
+            if action in {None, "b"}:
+                return None
+            if action == "a":
+                target = choose_job([job for job in jobs if job.state == "RUNNING"], action_label="Attach Remote")
+                if target is None:
+                    continue
+                session = service.attach(target.job_id)
+                render_remote_session(service, session)
+            elif action == "t":
+                profile = select_remote_profile(service)
+                if profile is None:
+                    continue
+                session = service.start(profile.id)
+                render_remote_session(service, session)
+            elif action == "c":
+                session = service.connect_remote()
+                render_remote_session(service, session)
+            elif action == "s":
+                session = service.stop()
+                console.print(
+                    f"Stopped remote session for job [cyan]{session.job_id}[/cyan] "
+                    f"([bold]{session.session_type}[/bold])."
+                )
+            elif action == "u":
+                service.setup_full()
+                console.print(f"Local and remote setup complete for [bold]{cluster_name(service)}[/bold].")
+            elif action == "n":
+                service.clean()
+                console.print(f"Removed local SSH config for [bold]{service.compute_host_alias}[/bold].")
+            pause_for_continue()
+        except PersistentSessionLostError as exc:
+            console.print(f"[red]{exc}[/red]")
+            service.close()
+            follow_up = choose_remote_disconnect_action()
+            if follow_up == "q":
+                return 0
+            if follow_up == "b":
+                return None
 
 
 LOGO = """\
@@ -887,6 +1331,141 @@ def show_splash_and_load(service: SherlockService) -> list:
     return result
 
 
+def show_multi_cluster_splash_and_load(contexts: list[ClusterContext]) -> None:
+    console.print(Text.from_markup(LOGO))
+    for context in contexts:
+        log_path = context.service.ssh_log_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            log_path.write_text("")
+        except OSError:
+            pass
+        console.print(f"[dim]Connecting to {context.name}...[/dim]")
+        console.print(f"[dim italic]Log: {log_path}[/dim italic]")
+        refresh_cluster_context(context, ensure_connected=True)
+
+
+def render_cluster_sections(
+    contexts: list[ClusterContext],
+    *,
+    include_remote_session: bool = False,
+    logs: bool = False,
+) -> None:
+    console.print(build_multi_cluster_jobs_table(contexts))
+    if include_remote_session:
+        for context in contexts:
+            session = context.service.state.get_remote_session()
+            if session is None:
+                console.print(f"{context.name}: [yellow]Remote session: none[/yellow]")
+            else:
+                status = next((job.state for job in context.jobs if job.job_id == session.job_id), "gone")
+                console.print(
+                    f"{context.name}: Remote session: job [cyan]{session.job_id}[/cyan] "
+                    f"on [cyan]{session.node}:{session.port}[/cyan] "
+                    f"([bold]{session.session_type}[/bold], state [bold]{status}[/bold])"
+                )
+    if logs:
+        for context in contexts:
+            if context.load_error:
+                continue
+            for job in context.jobs:
+                detail = context.service.get_job_detail(job.job_id)
+                console.print(
+                    f"{context.name} {job.job_id} stdout={detail.stdout_path or '-'} stderr={detail.stderr_path or '-'}"
+                )
+
+
+def require_single_cluster_scope(args, verb: str) -> None:
+    if args.config:
+        return
+    raise SherlockError(f"`{verb}` requires --config when multiple clusters are enabled.")
+
+
+def run_multi_cluster_remote(contexts: list[ClusterContext], args) -> int:
+    if args.remote_command == "list":
+        refresh_all_cluster_contexts(contexts)
+        render_cluster_sections(contexts, include_remote_session=True)
+        return 0
+    if args.remote_command == "attach":
+        if args.job:
+            context, job = resolve_cluster_job_target(contexts, args.job, running_only=True)
+        else:
+            refresh_all_cluster_contexts(contexts)
+            running_contexts = [
+                ClusterContext(
+                    name=context.name,
+                    config_path=context.config_path,
+                    service=context.service,
+                    jobs=[job for job in context.jobs if job.state == "RUNNING"],
+                    load_error=context.load_error,
+                )
+                for context in contexts
+            ]
+            chosen = choose_cluster_job(running_contexts, action_label="Attach Remote")
+            if chosen is None:
+                return 0
+            context, job = chosen
+        session = context.service.attach(job.job_id)
+        render_remote_session(context.service, session)
+        return 0
+    if args.remote_command == "connect":
+        context = resolve_remote_session_context(contexts)
+        session = context.service.connect_remote()
+        render_remote_session(context.service, session)
+        return 0
+    if args.remote_command == "stop":
+        context = resolve_remote_session_context(contexts)
+        session = context.service.stop()
+        console.print(
+            f"Stopped remote session for job [cyan]{session.job_id}[/cyan] "
+            f"([bold]{session.session_type}[/bold])."
+        )
+        return 0
+    if args.remote_command == "clean":
+        context = resolve_remote_session_context(contexts)
+        context.service.clean()
+        console.print(f"Removed local SSH config for [bold]{context.service.compute_host_alias}[/bold].")
+        return 0
+    require_single_cluster_scope(args, f"remote {args.remote_command}")
+    raise SherlockError(f"Unknown remote command: {args.remote_command}")
+
+
+def run_multi_cluster_command(args) -> int:
+    contexts = build_cluster_contexts()
+    if not contexts:
+        raise SherlockError("No *_presets.toml config files found.")
+    try:
+        if args.command == "list":
+            refresh_all_cluster_contexts(contexts)
+            render_cluster_sections(contexts, logs=args.logs)
+            return 0
+        if args.command == "connect":
+            context, job = resolve_cluster_job_target(contexts, args.job, running_only=True)
+            info = context.service.connect_job(
+                job.job_id,
+                open_browser=not args.no_browser,
+                local_port=args.local_port,
+            )
+            render_jupyter_forwarding(info)
+            return 0
+        if args.command == "watch":
+            context, job = resolve_cluster_job_target(contexts, args.job)
+            status = context.service.watch_job(job.job_id, connect_on_run=args.connect_on_run, console=console)
+            console.print(f"{status.job_id} {status.name} {status.state}")
+            return 0
+        if args.command == "kill":
+            context, job = resolve_cluster_job_target(contexts, args.job)
+            job_id = context.service.kill_job(job.job_id)
+            console.print(f"Killed [cyan]{job_id}[/cyan]")
+            return 0
+        if args.command == "remote":
+            return run_multi_cluster_remote(contexts, args)
+        require_single_cluster_scope(args, args.command)
+        raise SherlockError(f"Unknown command: {args.command}")
+    finally:
+        close_cluster_contexts(contexts)
+
+
 def interactive_menu(service: RemoteService) -> int | str:
     interrupt_tracker = InterruptTracker()
     first_load = True
@@ -898,6 +1477,8 @@ def interactive_menu(service: RemoteService) -> int | str:
             else:
                 jobs = service.list_jobs()
             action = choose_action(jobs, refresh_callback=service.list_jobs)
+            if action == DISCONNECT_SENTINEL:
+                raise PersistentSessionLostError("Persistent SSH session disconnected.")
             should_pause = action not in {"r", "refresh", "q", "quit"}
             if action in {"q", "quit"}:
                 return 0
@@ -934,7 +1515,8 @@ def interactive_menu(service: RemoteService) -> int | str:
                 if target is None:
                     should_pause = False
                     continue
-                info = service.connect_job(target.job_id, open_browser=True)
+                local_port = prompt_local_connect_port(target)
+                info = service.connect_job(target.job_id, open_browser=True, local_port=local_port)
                 render_jupyter_forwarding(info)
             elif action in {"w", "watch"}:
                 target = choose_job(jobs, action_label="Watch")
@@ -957,10 +1539,127 @@ def interactive_menu(service: RemoteService) -> int | str:
                     continue
                 render_logs(service.get_job_logs(target.job_id))
             elif action in {"m", "remote"}:
-                interactive_remote_menu(service)
+                result = interactive_remote_menu(service)
+                if result == 0:
+                    return 0
                 should_pause = False
             elif action in {"s", "switch"}:
                 return SWITCH_SENTINEL
+            else:
+                console.print("[red]Unknown action.[/red]")
+        except PersistentSessionLostError as exc:
+            console.print(f"[red]{exc}[/red]")
+            service.close()
+            follow_up = choose_disconnect_action(allow_switch=True)
+            if follow_up == "q":
+                return 0
+            if follow_up == "s":
+                return SWITCH_SENTINEL
+            first_load = True
+            continue
+        except SherlockError as exc:
+            console.print(f"[red]{exc}[/red]")
+            should_pause = True
+        except KeyboardInterrupt:
+            console.print()
+            if should_exit_on_interrupt(interrupt_tracker):
+                console.print("[yellow]Exiting on second Ctrl+C.[/yellow]")
+                return 130
+            console.print("[yellow]Press Ctrl+C again within 2 seconds to exit.[/yellow]")
+            should_pause = False
+
+        if should_pause:
+            pause_for_continue()
+
+
+def interactive_multi_cluster_menu(contexts: list[ClusterContext]) -> int:
+    if not contexts:
+        raise SherlockError("No cluster configs available.")
+    interrupt_tracker = InterruptTracker()
+    active_index = 0
+    first_load = True
+    while True:
+        should_pause = False
+        try:
+            if first_load:
+                show_multi_cluster_splash_and_load(contexts)
+                first_load = False
+            action, active_index = choose_multi_cluster_action(
+                contexts,
+                active_index=active_index,
+                refresh_callback=lambda: refresh_all_cluster_contexts(contexts),
+            )
+            active = contexts[active_index]
+            service = active.service
+            jobs = active.jobs
+            should_pause = action not in {"r", "refresh", "q", "quit"}
+            if action in {"q", "quit"}:
+                return 0
+            if action in {"r", "refresh"}:
+                refresh_all_cluster_contexts(contexts)
+                continue
+            if action in {"n", "new"}:
+                args = argparse.Namespace(
+                    preset=None,
+                    job_name=None,
+                    notebook_dir=None,
+                    port=None,
+                    partition=None,
+                    account=None,
+                    mem=None,
+                    time=None,
+                    cpus=None,
+                    gpus=None,
+                    nodelist=None,
+                    constraint=None,
+                    no_browser=False,
+                )
+                request = build_submission_request(service, args)
+                if request is None:
+                    should_pause = False
+                    continue
+                job_id = service.submit_job(request)
+                console.print(f"Submitted [cyan]{job_id}[/cyan] on [bold]{active.name}[/bold] as [bold]{request.job_name}[/bold].")
+                refresh_cluster_context(active)
+                should_pause = False
+            elif action in {"c", "connect"}:
+                running_jobs = [job for job in jobs if job.state == "RUNNING"]
+                target = choose_job(running_jobs, action_label=f"Connect ({active.name})")
+                if target is None:
+                    should_pause = False
+                    continue
+                local_port = prompt_local_connect_port(target)
+                info = service.connect_job(target.job_id, open_browser=True, local_port=local_port)
+                render_jupyter_forwarding(info)
+                refresh_cluster_context(active)
+            elif action in {"w", "watch"}:
+                target = choose_job(jobs, action_label=f"Watch ({active.name})")
+                if target is None:
+                    should_pause = False
+                    continue
+                status = service.watch_job(target.job_id, console=console)
+                console.print(f"Watch finished with [bold]{status.state}[/bold]")
+                refresh_cluster_context(active)
+            elif action in {"k", "kill"}:
+                target = choose_job(jobs, action_label=f"Kill ({active.name})")
+                if target is None:
+                    should_pause = False
+                    continue
+                job_id = service.kill_job(target.job_id)
+                console.print(f"Killed [cyan]{job_id}[/cyan] on [bold]{active.name}[/bold]")
+                refresh_cluster_context(active)
+            elif action in {"l", "logs"}:
+                target = choose_job(jobs, action_label=f"View Logs ({active.name})")
+                if target is None:
+                    should_pause = False
+                    continue
+                render_logs(service.get_job_logs(target.job_id))
+            elif action in {"m", "remote"}:
+                result = interactive_remote_menu(service)
+                if result == 0:
+                    return 0
+                refresh_cluster_context(active)
+                should_pause = False
             else:
                 console.print("[red]Unknown action.[/red]")
         except SherlockError as exc:
@@ -975,7 +1674,7 @@ def interactive_menu(service: RemoteService) -> int | str:
             should_pause = False
 
         if should_pause:
-            Prompt.ask("Press Enter to continue", default="")
+            pause_for_continue()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -993,8 +1692,18 @@ def main(argv: list[str] | None = None) -> int:
             console.print("[yellow]Interrupted.[/yellow]")
             return 130
 
-    # Non-interactive subcommands: use a single service (--config or default).
     if args.command is not None:
+        if not args.config:
+            try:
+                return run_multi_cluster_command(args)
+            except SherlockError as exc:
+                console.print(f"[red]{exc}[/red]")
+                return 1
+            except KeyboardInterrupt:
+                console.print()
+                console.print("[yellow]Interrupted.[/yellow]")
+                return 130
+
         service = make_remote_service(args.config) if args.command == "remote" else make_service(args.config)
         try:
             if args.command == "list":
@@ -1010,7 +1719,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "new":
                 return run_new(service, args)
             if args.command == "connect":
-                info = service.connect_job(args.job, open_browser=not args.no_browser)
+                info = service.connect_job(
+                    args.job,
+                    open_browser=not args.no_browser,
+                    local_port=args.local_port,
+                )
                 render_jupyter_forwarding(info)
                 return 0
             if args.command == "watch":
@@ -1023,6 +1736,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
             if args.command == "remote":
                 return run_remote(service, args)
+            return 0
         except SherlockError as exc:
             console.print(f"[red]{exc}[/red]")
             return 1
@@ -1032,42 +1746,22 @@ def main(argv: list[str] | None = None) -> int:
             return 130
         finally:
             service.close()
-        return 0
-
-    # Interactive mode: cluster selection loop.
-    if args.config:
-        # --config given: skip cluster selection, go straight to menu.
-        service = make_remote_service(args.config)
-        try:
-            return interactive_menu(service)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted.[/yellow]")
-            return 130
-        finally:
-            service.close()
-
-    clusters = discover_configs()
-    if not clusters:
-        console.print("[red]No *_presets.toml config files found.[/red]")
-        return 1
 
     try:
-        while True:
-            if len(clusters) == 1:
-                chosen = clusters[0]
-            else:
-                chosen = choose_cluster(clusters)
-                if chosen is None:
-                    return 0
-            _name, config_path = chosen
-            service = make_remote_service(str(config_path))
+        if args.config:
+            service = make_remote_service(args.config)
             try:
-                result = interactive_menu(service)
+                return interactive_menu(service)
             finally:
                 service.close()
-            if result != SWITCH_SENTINEL:
-                return result if isinstance(result, int) else 0
-            # SWITCH_SENTINEL: loop back to cluster selection
+        contexts = build_cluster_contexts()
+        if not contexts:
+            console.print("[red]No *_presets.toml config files found.[/red]")
+            return 1
+        try:
+            return interactive_multi_cluster_menu(contexts)
+        finally:
+            close_cluster_contexts(contexts)
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         return 130

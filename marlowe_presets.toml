@@ -38,3 +38,16 @@ mem = "256G"
 time = "48:00:00"
 port = 56810
 isolated_compute_node = false
+
+[[presets]]
+id = "marlowe-batch-cpu"
+label = "Marlowe Batch CPU"
+job_name = "marlowe-CPU-jupyterlab"
+sbatch_script = "sbatches/Marlowe-CPU-jupyterlab.sbatch"
+partition = "batch"
+account = "marlowe-m000134-pm05"
+cpus = 8
+mem = "256G"
+time = "48:00:00"
+port = 56811
+isolated_compute_node = false

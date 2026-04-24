@@ -5,7 +5,12 @@ import unittest
 
 from sherlock_cli.config import load_config
 from sherlock_cli.models import SubmissionRequest
-from sherlock_cli.service import SherlockError, SherlockService
+from sherlock_cli.service import (
+    PersistentSessionLostError,
+    SherlockError,
+    SherlockService,
+    SessionDisconnectedError,
+)
 from sherlock_cli.state import StateStore
 
 
@@ -68,6 +73,17 @@ class FakePopen:
         self.pid = 7777
 
 
+class DisconnectingRemoteShell:
+    def __init__(self):
+        self.closed = False
+
+    def run(self, command, check=True):
+        raise SessionDisconnectedError("Persistent SSH session disconnected.")
+
+    def close(self):
+        self.closed = True
+
+
 class ServiceTests(unittest.TestCase):
     def make_service(self, tmpdir: str):
         config = load_config()
@@ -75,7 +91,7 @@ class ServiceTests(unittest.TestCase):
         session_factory = FakeSessionFactory()
         service = SherlockService(
             config,
-            StateStore(config.state_path),
+            StateStore(config.state_path, config.connection.resource),
             popen_factory=FakePopen,
             ssh_session_factory=session_factory,
             sleeper=lambda _seconds: None,
@@ -176,6 +192,19 @@ class ServiceTests(unittest.TestCase):
             self.assertTrue(any("squeue -u" in command for command in commands))
             self.assertTrue(any("scontrol show job -o 4321" in command for command in commands))
 
+    def test_list_jobs_wraps_remote_commands_with_shell_init(self):
+        with TemporaryDirectory() as tmpdir:
+            service, session_factory = self.make_service(tmpdir)
+            service.config.connection.shell_init = "module load slurm >/dev/null 2>&1 || true"
+
+            service.list_jobs()
+
+            session = session_factory.sessions[0]
+            commands = [command for command, _check in session.commands]
+            self.assertTrue(any("bash -lc" in command for command in commands))
+            self.assertTrue(any("module load slurm" in command for command in commands))
+            self.assertTrue(any("squeue -u" in command for command in commands))
+
     def test_connect_job_uses_recorded_port_without_waiting_for_logs(self):
         with TemporaryDirectory() as tmpdir:
             service, _session_factory = self.make_service(tmpdir)
@@ -231,6 +260,36 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(str(ctx.exception), "Local port 56793 is already in use.")
 
+    def test_connect_job_restarts_existing_tunnel_when_local_port_changes(self):
+        with TemporaryDirectory() as tmpdir:
+            service, _session_factory = self.make_service(tmpdir)
+            service.state.record_submission(
+                job_id="4321",
+                job_name="GPU-jupyterlab",
+                preset_id="xiaojie-gpu",
+                notebook_dir="/oak/demo",
+                remote_port=56793,
+                remote_stdout="/home/demo/forward-util/GPU-jupyterlab-4321.out",
+                remote_stderr="/home/demo/forward-util/GPU-jupyterlab-4321.err",
+                remote_template="/home/demo/forward-util/GPU-jupyterlab.sbatch",
+            )
+            service.state.update_tunnel("4321", 999999, 56793, "http://localhost:56793/")
+
+            with (
+                mock.patch.object(service, "_pid_alive", return_value=True),
+                mock.patch.object(service, "_terminate_pid") as terminate_mock,
+                mock.patch.object(service, "_port_available", return_value=True),
+            ):
+                info = service.connect_job("4321", open_browser=False, local_port=56790)
+
+            terminate_mock.assert_called_once_with(999999)
+            self.assertEqual(info.local_port, 56790)
+            self.assertEqual(info.local_url, "http://localhost:56790/")
+            metadata = service.state.get("4321")
+            self.assertEqual(metadata.tunnel_pid, 7777)
+            self.assertEqual(metadata.local_port, 56790)
+            self.assertEqual(metadata.jupyter_url, "http://localhost:56790/")
+
     def test_kill_job_clears_tunnel(self):
         with TemporaryDirectory() as tmpdir:
             service, _session_factory = self.make_service(tmpdir)
@@ -249,6 +308,24 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(job_id, "4321")
             metadata = service.state.get("4321")
             self.assertIsNone(metadata.tunnel_pid)
+
+    def test_disconnect_raises_persistent_session_lost_and_closes_session(self):
+        with TemporaryDirectory() as tmpdir:
+            config = load_config()
+            config.state_path = Path(tmpdir) / "state.json"
+            shell = DisconnectingRemoteShell()
+            service = SherlockService(
+                config,
+                StateStore(config.state_path, config.connection.resource),
+                ssh_session_factory=lambda: shell,
+            )
+
+            with self.assertRaises(PersistentSessionLostError) as ctx:
+                service.list_jobs()
+
+            self.assertEqual(str(ctx.exception), "Persistent SSH session disconnected.")
+            self.assertTrue(shell.closed)
+            self.assertIsNone(service._ssh_session)
 
 
     def test_connect_external_job_adopts_into_state(self):

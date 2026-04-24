@@ -13,8 +13,9 @@ def utc_now() -> str:
 
 
 class StateStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, resource: str):
         self.path = path
+        self.resource = resource
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._data = self._load()
 
@@ -22,6 +23,17 @@ class StateStore:
         if not self.path.exists():
             return StateData()
         raw = json.loads(self.path.read_text())
+        cluster_raw = self._load_cluster_payload(raw)
+        return self._decode_state(cluster_raw)
+
+    def _load_cluster_payload(self, raw: dict) -> dict:
+        clusters = raw.get("clusters")
+        if isinstance(clusters, dict):
+            return clusters.get(self.resource, {})
+        return raw
+
+    @staticmethod
+    def _decode_state(raw: dict) -> StateData:
         jobs = {
             job_id: JobMetadata(**payload)
             for job_id, payload in raw.get("jobs", {}).items()
@@ -31,9 +43,22 @@ class StateStore:
         return StateData(jobs=jobs, remote_session=remote_session)
 
     def save(self) -> None:
-        payload = {
+        raw = {}
+        if self.path.exists():
+            raw = json.loads(self.path.read_text())
+        clusters = raw.get("clusters")
+        if not isinstance(clusters, dict):
+            legacy_raw = raw if raw else {}
+            clusters = {}
+            if legacy_raw.get("jobs") or legacy_raw.get("remote_session"):
+                clusters[self.resource] = legacy_raw
+        clusters[self.resource] = {
             "jobs": {job_id: asdict(metadata) for job_id, metadata in self._data.jobs.items()},
             "remote_session": asdict(self._data.remote_session) if self._data.remote_session else None,
+        }
+        payload = {
+            "version": 2,
+            "clusters": dict(sorted(clusters.items())),
         }
         self.path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 

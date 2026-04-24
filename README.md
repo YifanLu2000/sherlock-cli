@@ -78,7 +78,7 @@ Or launch the interactive selector:
 sherlock-cli new
 ```
 
-List current jobs:
+List current jobs across all discovered cluster configs:
 
 ```bash
 sherlock-cli list
@@ -94,6 +94,8 @@ Connect a running job to localhost:
 
 ```bash
 sherlock-cli connect 123456
+sherlock-cli connect marlowe:123456
+sherlock-cli connect marlowe:123456 --local-port 56790
 ```
 
 Cancel a job:
@@ -230,6 +232,7 @@ Marlowe does not ship default remote start profiles, so the usual path there is 
 ## Interactive Mode
 
 Running `sherlock-cli` with no subcommand opens the interactive menu.
+Without `--config`, it shows every discovered cluster as its own jobs table in one stacked screen.
 
 Home screen actions:
 
@@ -240,14 +243,14 @@ Home screen actions:
 - `Kill`
 - `Logs`
 - `Remote`
-- `Switch`
 - `Quit`
 
 Useful controls:
 
+- up and down arrows move between cluster tables
 - left and right arrows move between actions
 - `Enter` confirms the current action
-- `r`, `n`, `c`, `w`, `k`, `l`, `m`, `s`, `q` work as shortcuts
+- `r`, `n`, `c`, `w`, `k`, `l`, `m`, `q` work as shortcuts
 - `Ctrl+C` twice within 2 seconds exits interactive mode
 
 When the CLI needs a specific job, it opens a selector:
@@ -262,10 +265,12 @@ The `Remote` action opens a second menu for `setup`, `attach`, `start`, `connect
 
 ### `sherlock-cli list`
 
-Show current `PENDING` and `RUNNING` jobs for the configured cluster user.
+Show current `PENDING` and `RUNNING` jobs for all discovered clusters by default.
+Use `--config` to limit the output to one cluster.
 
 ```bash
 sherlock-cli list
+sherlock-cli --config ~/.config/sherlock-cli/marlowe.toml list
 sherlock-cli list --logs
 ```
 
@@ -300,6 +305,8 @@ Connect a running Jupyter job to localhost.
 
 ```bash
 sherlock-cli connect 123456
+sherlock-cli connect marlowe:123456
+sherlock-cli connect marlowe:123456 --local-port 56790
 ```
 
 `<job>` can be either:
@@ -307,7 +314,11 @@ sherlock-cli connect 123456
 - a job id
 - a unique active job name
 
+Without `--config`, the CLI searches every discovered cluster. If a bare target matches more than one cluster, rerun the command with `cluster:job` or `--config`.
+
 The CLI resolves the compute node, reads the remote logs, extracts the Jupyter URL when possible, and starts SSH port forwarding.
+Use `--local-port` when you want the localhost side to differ from the remote Jupyter port. If omitted, the CLI keeps the current default and uses the remote Jupyter port locally.
+In the interactive menu, `Connect` prompts for the local port and pre-fills the known remote Jupyter port when available.
 
 ### `sherlock-cli watch <job>`
 
@@ -316,6 +327,7 @@ Watch a job until it becomes `RUNNING` or reaches a terminal state.
 ```bash
 sherlock-cli watch 123456
 sherlock-cli watch 123456 --connect-on-run
+sherlock-cli watch sherlock:123456
 ```
 
 ### `sherlock-cli kill <job>`
@@ -324,6 +336,7 @@ Cancel a job with `scancel`.
 
 ```bash
 sherlock-cli kill 123456
+sherlock-cli kill marlowe:123456
 ```
 
 If the CLI created a local SSH tunnel for that job, it also terminates the local tunnel process.
@@ -356,6 +369,7 @@ Attach a compute-node remote session to an existing running job.
 
 ```bash
 sherlock-cli remote attach 123456
+sherlock-cli remote attach marlowe:123456
 ```
 
 If no job is provided, the CLI prompts you to choose from current `RUNNING` jobs.
@@ -379,9 +393,11 @@ Reconnect to the current remote session by refreshing the local compute-node SSH
 sherlock-cli remote connect
 ```
 
+Without `--config`, this works only when exactly one configured cluster has saved remote session metadata.
+
 ### `sherlock-cli remote list`
 
-Show cluster jobs together with remote session metadata.
+Show cluster jobs together with remote session metadata for every discovered cluster by default.
 
 ```bash
 sherlock-cli remote list
@@ -405,7 +421,7 @@ sherlock-cli remote clean
 
 ## Configuration and Presets
 
-By default the CLI reads `~/.config/sherlock-cli/sherlock.toml` when it exists, and otherwise falls back to the bundled `sherlock_presets.toml`. You can switch configs with:
+By default the CLI discovers every available config and uses them together for the stacked dashboard plus cross-cluster `list` / `connect` / `watch` / `kill` / `remote` commands. Use `--config` whenever you want to scope a command to one cluster:
 
 ```bash
 sherlock-cli --config /path/to/config.toml list

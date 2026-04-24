@@ -33,6 +33,10 @@ class SessionDisconnectedError(SherlockError):
     pass
 
 
+class PersistentSessionLostError(SherlockError):
+    pass
+
+
 class PersistentSSHSession:
     def __init__(
         self,
@@ -373,7 +377,7 @@ class SherlockService:
                 return status
             self.sleeper(self.config.poll_interval_seconds)
 
-    def connect_job(self, target: str, *, open_browser: bool = True) -> JupyterInfo:
+    def connect_job(self, target: str, *, open_browser: bool = True, local_port: int | None = None) -> JupyterInfo:
         job = self.resolve_job(target) if not target.isdigit() else None
         job_id = target if target.isdigit() else job.job_id
         detail = self.get_job_detail(job_id)
@@ -388,10 +392,13 @@ class SherlockService:
             jupyter = self._build_direct_jupyter_info(remote_port, metadata)
         existing = metadata.tunnel_pid if metadata else None
         if existing and self._pid_alive(existing):
-            jupyter.local_port = metadata.local_port
-            jupyter.local_url = metadata.jupyter_url
-            return jupyter
-        local_port = self._choose_local_port(jupyter.port)
+            if local_port is None or metadata.local_port == local_port:
+                jupyter.local_port = metadata.local_port
+                jupyter.local_url = metadata.jupyter_url
+                return jupyter
+            self._terminate_pid(existing)
+            self.state.clear_tunnel(job_id)
+        local_port = self._choose_local_port(local_port or jupyter.port)
 
         if not metadata:
             metadata = self._adopt_external_job(job_id, detail, jupyter.port)
@@ -628,14 +635,10 @@ class SherlockService:
         """Establish the SSH session, allowing interactive auth (password/2FA).
 
         Runs a trivial command to force SSH to complete authentication
-        before returning.  This keeps auth prompts visible on the terminal
-        (outside of Rich Live).  Also runs shell_init if configured (e.g.
-        ``module load slurm`` on clusters where SLURM isn't on the default
-        PATH).
+        before returning. This keeps auth prompts visible on the terminal
+        (outside of Rich Live). Any configured shell_init runs through
+        _remote_bash(), so reconnects get the same environment setup.
         """
-        init = self.config.connection.shell_init
-        if init:
-            self._ssh_output(self._remote_bash(init), check=False)
         self._ssh_output(self._remote_bash("echo __sherlock_connected__"))
 
     def _ssh_session_or_create(self):
@@ -643,13 +646,15 @@ class SherlockService:
             self._ssh_session = self.ssh_session_factory()
         return self._ssh_session
 
-    @staticmethod
-    def _remote_bash(command: str) -> str:
-        return command
+    def _remote_bash(self, command: str) -> str:
+        init = self.config.connection.shell_init
+        if not init:
+            return command
+        return f"bash -lc {shlex.quote(f'{init}; {command}')}"
 
     def _ssh_output(self, command: str, *, check: bool = True) -> str:
         try:
             return self._ssh_session_or_create().run(command, check=check)
-        except SessionDisconnectedError:
+        except SessionDisconnectedError as exc:
             self.close()
-            raise SherlockError("Persistent SSH session disconnected.")
+            raise PersistentSessionLostError("Persistent SSH session disconnected.") from exc

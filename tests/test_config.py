@@ -18,6 +18,12 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("gpu", config.remote_profiles)
         self.assertEqual(config.remote_default_profile_id, "cpu")
 
+    def test_load_marlowe_config_cpu_template_exists(self):
+        config = load_config("marlowe_presets.toml")
+        self.assertIn("marlowe-batch-cpu", config.presets)
+        template_path = config.repo_root / config.presets["marlowe-batch-cpu"].sbatch_script
+        self.assertTrue(template_path.exists())
+
     def test_custom_config_path(self):
         with TemporaryDirectory() as tmpdir:
             config_path = Path(tmpdir) / "config.toml"

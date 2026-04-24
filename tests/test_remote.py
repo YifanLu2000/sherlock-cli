@@ -83,7 +83,7 @@ class RemoteServiceTests(unittest.TestCase):
         ssh_config = SshConfigManager(Path(tmpdir) / "ssh_config")
         service = RemoteService(
             config,
-            StateStore(config.state_path),
+            StateStore(config.state_path, config.connection.resource),
             runner=runner,
             ssh_session_factory=session_factory,
             sleeper=lambda _seconds: None,
@@ -168,6 +168,10 @@ class RemoteServiceTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             config = load_config("marlowe_presets.toml")
             config.state_path = Path(tmpdir) / "state.json"
-            service = RemoteService(config, StateStore(config.state_path), runner=FakeRunner())
+            service = RemoteService(
+                config,
+                StateStore(config.state_path, config.connection.resource),
+                runner=FakeRunner(),
+            )
             with self.assertRaises(SherlockError):
                 service.resolve_remote_profile(None)
