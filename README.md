@@ -232,7 +232,9 @@ Marlowe does not ship default remote start profiles, so the usual path there is 
 ## Interactive Mode
 
 Running `sherlock-cli` with no subcommand opens the interactive menu.
-Without `--config`, it shows every discovered cluster as its own jobs table in one stacked screen.
+Without `--config`, it first asks which discovered cluster to use, then opens that cluster's interactive menu.
+Use `Servers` to open a multi-cluster dashboard with every discovered cluster shown together.
+In that dashboard, up and down arrows choose which cluster receives the selected action.
 
 Home screen actions:
 
@@ -243,14 +245,14 @@ Home screen actions:
 - `Kill`
 - `Logs`
 - `Remote`
+- `Servers`
 - `Quit`
 
 Useful controls:
 
-- up and down arrows move between cluster tables
 - left and right arrows move between actions
 - `Enter` confirms the current action
-- `r`, `n`, `c`, `w`, `k`, `l`, `m`, `q` work as shortcuts
+- `r`, `n`, `c`, `w`, `k`, `l`, `m`, `s`, `q` work as shortcuts
 - `Ctrl+C` twice within 2 seconds exits interactive mode
 
 When the CLI needs a specific job, it opens a selector:
@@ -421,7 +423,7 @@ sherlock-cli remote clean
 
 ## Configuration and Presets
 
-By default the CLI discovers every available config and uses them together for the stacked dashboard plus cross-cluster `list` / `connect` / `watch` / `kill` / `remote` commands. Use `--config` whenever you want to scope a command to one cluster:
+By default the CLI discovers every available config. Interactive mode starts with one selected cluster and can open the `Servers` dashboard when needed; non-interactive `list` / `connect` / `watch` / `kill` / `remote` commands can search across discovered clusters. Use `--config` whenever you want to scope a command to one cluster:
 
 ```bash
 sherlock-cli --config /path/to/config.toml list
@@ -450,6 +452,7 @@ Bundled Jupyter presets:
 - `bigmem`
 - `stanford-gpu`
 - `marlowe-batch-gpu`
+- `marlowe-batch-cpu`
 
 Each preset defines the job template and runtime defaults such as partition, CPU count, GPU count, memory, time limit, port, and optional Slurm fields like account, nodelist, or constraint.
 

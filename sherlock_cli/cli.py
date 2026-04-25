@@ -42,7 +42,7 @@ MENU_ACTIONS = [
     ("k", "Kill"),
     ("l", "Logs"),
     ("m", "Remote"),
-    ("s", "Switch"),
+    ("s", "Servers"),
     ("q", "Quit"),
 ]
 REMOTE_ACTIONS = [
@@ -501,7 +501,7 @@ def build_main_menu_view(jobs, selected_index: int):
 def build_multi_cluster_action_selector(selected_index: int):
     text = build_shortcut_selector("Actions", MULTI_CLUSTER_MENU_ACTIONS, selected_index)
     help_text = Text(
-        "Use up/down to switch clusters, left/right to switch actions, then Enter.",
+        "Use up/down to move between clusters, left/right to choose an action, then Enter.",
         style="dim",
     )
     return Group(text, help_text)
@@ -849,12 +849,12 @@ def choose_remote_action(service: RemoteService, jobs, *, refresh_callback=None)
                         return shortcut
 
 
-def choose_disconnect_action(*, allow_switch: bool) -> str:
+def choose_disconnect_action(*, allow_servers: bool) -> str:
     choices = ["r", "q"]
     prompt = "Connection lost. Retry or quit"
-    if allow_switch:
+    if allow_servers:
         choices.insert(1, "s")
-        prompt = "Connection lost. Retry, switch cluster, or quit"
+        prompt = "Connection lost. Retry, open servers, or quit"
     return Prompt.ask(prompt, choices=choices, default="r").lower()
 
 
@@ -1239,7 +1239,7 @@ LOGO = """\
  |____/ \\___|_|    \\_/ \\___|_|[/bold cyan]
 """
 
-SWITCH_SENTINEL = "__switch__"
+SERVERS_SENTINEL = "__servers__"
 
 
 def build_cluster_selector(clusters: list[tuple[str, object]], selected_index: int):
@@ -1482,8 +1482,8 @@ def interactive_menu(service: RemoteService) -> int | str:
             should_pause = action not in {"r", "refresh", "q", "quit"}
             if action in {"q", "quit"}:
                 return 0
-            if action == SWITCH_SENTINEL:
-                return SWITCH_SENTINEL
+            if action == SERVERS_SENTINEL:
+                return SERVERS_SENTINEL
             if action in {"r", "refresh"}:
                 continue
             if action in {"n", "new"}:
@@ -1543,18 +1543,18 @@ def interactive_menu(service: RemoteService) -> int | str:
                 if result == 0:
                     return 0
                 should_pause = False
-            elif action in {"s", "switch"}:
-                return SWITCH_SENTINEL
+            elif action in {"s", "servers", "clusters", "add"}:
+                return SERVERS_SENTINEL
             else:
                 console.print("[red]Unknown action.[/red]")
         except PersistentSessionLostError as exc:
             console.print(f"[red]{exc}[/red]")
             service.close()
-            follow_up = choose_disconnect_action(allow_switch=True)
+            follow_up = choose_disconnect_action(allow_servers=True)
             if follow_up == "q":
                 return 0
             if follow_up == "s":
-                return SWITCH_SENTINEL
+                return SERVERS_SENTINEL
             first_load = True
             continue
         except SherlockError as exc:
@@ -1572,11 +1572,11 @@ def interactive_menu(service: RemoteService) -> int | str:
             pause_for_continue()
 
 
-def interactive_multi_cluster_menu(contexts: list[ClusterContext]) -> int:
+def interactive_multi_cluster_menu(contexts: list[ClusterContext], *, active_index: int = 0) -> int:
     if not contexts:
         raise SherlockError("No cluster configs available.")
     interrupt_tracker = InterruptTracker()
-    active_index = 0
+    active_index = max(0, min(active_index, len(contexts) - 1))
     first_load = True
     while True:
         should_pause = False
@@ -1677,6 +1677,42 @@ def interactive_multi_cluster_menu(contexts: list[ClusterContext]) -> int:
             pause_for_continue()
 
 
+def interactive_cluster_selection_loop() -> int:
+    while True:
+        clusters = discover_configs()
+        if not clusters:
+            console.print("[red]No *_presets.toml config files found.[/red]")
+            return 1
+        if len(clusters) == 1:
+            chosen = clusters[0]
+        else:
+            chosen = choose_cluster(clusters)
+            if chosen is None:
+                return 0
+        _name, config_path = chosen
+        service = make_remote_service(str(config_path))
+        try:
+            result = interactive_menu(service)
+        finally:
+            service.close()
+        if result == SERVERS_SENTINEL:
+            contexts = build_cluster_contexts()
+            active_index = next(
+                (
+                    index
+                    for index, context in enumerate(contexts)
+                    if context.config_path == Path(config_path)
+                ),
+                0,
+            )
+            try:
+                return interactive_multi_cluster_menu(contexts, active_index=active_index)
+            finally:
+                close_cluster_contexts(contexts)
+        else:
+            return result if isinstance(result, int) else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1754,14 +1790,7 @@ def main(argv: list[str] | None = None) -> int:
                 return interactive_menu(service)
             finally:
                 service.close()
-        contexts = build_cluster_contexts()
-        if not contexts:
-            console.print("[red]No *_presets.toml config files found.[/red]")
-            return 1
-        try:
-            return interactive_multi_cluster_menu(contexts)
-        finally:
-            close_cluster_contexts(contexts)
+        return interactive_cluster_selection_loop()
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         return 130

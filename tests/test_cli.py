@@ -13,7 +13,7 @@ from sherlock_cli.cli import (
     ESC_KEY,
     InterruptTracker,
     MENU_ACTIONS,
-    SWITCH_SENTINEL,
+    SERVERS_SENTINEL,
     _read_raw_key,
     build_cluster_jobs_table,
     build_jobs_table,
@@ -25,6 +25,7 @@ from sherlock_cli.cli import (
     choose_multi_cluster_action,
     choose_remote_action,
     interactive_menu,
+    interactive_cluster_selection_loop,
     interactive_multi_cluster_menu,
     interactive_remote_menu,
     main,
@@ -320,11 +321,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("Sherlock", names)
         self.assertIn("Marlowe", names)
 
-    def test_switch_sentinel_is_string(self):
-        self.assertIsInstance(SWITCH_SENTINEL, str)
+    def test_servers_sentinel_is_string(self):
+        self.assertIsInstance(SERVERS_SENTINEL, str)
 
     def test_main_menu_contains_remote_action(self):
         self.assertIn(("m", "Remote"), MENU_ACTIONS)
+        self.assertIn(("s", "Servers"), MENU_ACTIONS)
 
     def test_select_remote_profile_escape_returns_none(self):
         with TemporaryDirectory() as tmpdir:
@@ -582,20 +584,64 @@ class CliTests(unittest.TestCase):
         marlowe_service.connect_job.assert_called_once_with("456", open_browser=True, local_port=56790)
         sherlock_service.connect_job.assert_not_called()
 
-    def test_main_without_config_uses_multi_cluster_interactive_menu(self):
-        contexts = [
-            ClusterContext("Sherlock", Path("/tmp/sherlock.toml"), FakeMultiClusterService("Sherlock", "sherlock"))
-        ]
+    def test_main_without_config_uses_cluster_selector(self):
+        service = mock.Mock()
         with (
-            mock.patch("sherlock_cli.cli.build_cluster_contexts", return_value=contexts),
-            mock.patch("sherlock_cli.cli.interactive_multi_cluster_menu", return_value=0) as interactive_mock,
-            mock.patch("sherlock_cli.cli.choose_cluster") as choose_cluster_mock,
+            mock.patch(
+                "sherlock_cli.cli.discover_configs",
+                return_value=[("Sherlock", Path("/tmp/sherlock.toml")), ("Marlowe", Path("/tmp/marlowe.toml"))],
+            ),
+            mock.patch(
+                "sherlock_cli.cli.choose_cluster",
+                return_value=("Marlowe", Path("/tmp/marlowe.toml")),
+            ) as choose_cluster_mock,
+            mock.patch("sherlock_cli.cli.make_remote_service", return_value=service) as make_service_mock,
+            mock.patch("sherlock_cli.cli.interactive_menu", return_value=0) as interactive_mock,
+            mock.patch("sherlock_cli.cli.interactive_multi_cluster_menu") as multi_cluster_mock,
         ):
             result = main([])
 
         self.assertEqual(result, 0)
-        interactive_mock.assert_called_once_with(contexts)
-        choose_cluster_mock.assert_not_called()
+        choose_cluster_mock.assert_called_once()
+        make_service_mock.assert_called_once_with("/tmp/marlowe.toml")
+        interactive_mock.assert_called_once_with(service)
+        service.close.assert_called_once()
+        multi_cluster_mock.assert_not_called()
+
+    def test_interactive_cluster_selection_loop_opens_multi_cluster_dashboard_from_servers(self):
+        sherlock_path = Path("/tmp/sherlock.toml")
+        marlowe_path = Path("/tmp/marlowe.toml")
+        sherlock_service = mock.Mock()
+        contexts = [
+            ClusterContext("Sherlock", sherlock_path, FakeMultiClusterService("Sherlock", "sherlock")),
+            ClusterContext("Marlowe", marlowe_path, FakeMultiClusterService("Marlowe", "marlowe")),
+        ]
+
+        with (
+            mock.patch(
+                "sherlock_cli.cli.discover_configs",
+                return_value=[("Sherlock", sherlock_path), ("Marlowe", marlowe_path)],
+            ),
+            mock.patch("sherlock_cli.cli.choose_cluster", return_value=("Marlowe", marlowe_path)),
+            mock.patch("sherlock_cli.cli.make_remote_service", return_value=sherlock_service) as make_service_mock,
+            mock.patch(
+                "sherlock_cli.cli.interactive_menu",
+                return_value=SERVERS_SENTINEL,
+            ),
+            mock.patch("sherlock_cli.cli.build_cluster_contexts", return_value=contexts),
+            mock.patch(
+                "sherlock_cli.cli.interactive_multi_cluster_menu",
+                return_value=0,
+            ) as multi_cluster_mock,
+            mock.patch("sherlock_cli.cli.close_cluster_contexts") as close_contexts_mock,
+        ):
+            result = interactive_cluster_selection_loop()
+
+        self.assertEqual(result, 0)
+        make_service_mock.assert_called_once_with(str(marlowe_path))
+        sherlock_service.close.assert_called_once()
+        multi_cluster_mock.assert_called_once_with(contexts, active_index=1)
+        close_contexts_mock.assert_called_once_with(contexts)
 
     def test_main_connect_passes_local_port_to_single_cluster_service(self):
         service = mock.Mock()
