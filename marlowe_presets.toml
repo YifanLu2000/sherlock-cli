@@ -51,3 +51,30 @@ mem = "256G"
 time = "48:00:00"
 port = 56811
 isolated_compute_node = false
+
+[[presets]]
+id = "marlowe-prempt-gpu"
+label = "Marlowe Prempt GPU"
+job_name = "marlowe-GPU-jupyterlab"
+sbatch_script = "sbatches/Marlowe-GPU-jupyterlab.sbatch"
+partition = "preempt"
+account = "marlowe-m000134"
+cpus = 8
+gpus = 1
+mem = "256G"
+time = "4:00:00"
+port = 56810
+isolated_compute_node = false
+
+[[presets]]
+id = "marlowe-prempt-cpu"
+label = "Marlowe Prempt CPU"
+job_name = "marlowe-CPU-jupyterlab"
+sbatch_script = "sbatches/Marlowe-CPU-jupyterlab.sbatch"
+partition = "preempt"
+account = "marlowe-m000134"
+cpus = 8
+mem = "256G"
+time = "4:00:00"
+port = 56811
+isolated_compute_node = false

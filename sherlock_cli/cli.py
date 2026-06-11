@@ -180,11 +180,16 @@ def cluster_aliases(service: SherlockService) -> set[str]:
     }
 
 
-def build_cluster_contexts() -> list[ClusterContext]:
+def build_cluster_contexts(reuse_services: dict[Path, RemoteService] | None = None) -> list[ClusterContext]:
+    reusable = {
+        Path(config_path).resolve(): service
+        for config_path, service in (reuse_services or {}).items()
+    }
     contexts: list[ClusterContext] = []
     for name, config_path in discover_configs():
-        service = make_remote_service(str(config_path))
-        contexts.append(ClusterContext(name=name, config_path=Path(config_path), service=service))
+        path = Path(config_path)
+        service = reusable.get(path.resolve()) or make_remote_service(str(config_path))
+        contexts.append(ClusterContext(name=name, config_path=path, service=service))
     return contexts
 
 
@@ -1691,26 +1696,28 @@ def interactive_cluster_selection_loop() -> int:
                 return 0
         _name, config_path = chosen
         service = make_remote_service(str(config_path))
+        service_handed_off = False
         try:
             result = interactive_menu(service)
-        finally:
-            service.close()
-        if result == SERVERS_SENTINEL:
-            contexts = build_cluster_contexts()
-            active_index = next(
-                (
-                    index
-                    for index, context in enumerate(contexts)
-                    if context.config_path == Path(config_path)
-                ),
-                0,
-            )
-            try:
-                return interactive_multi_cluster_menu(contexts, active_index=active_index)
-            finally:
-                close_cluster_contexts(contexts)
-        else:
+            if result == SERVERS_SENTINEL:
+                contexts = build_cluster_contexts(reuse_services={Path(config_path): service})
+                service_handed_off = any(context.service is service for context in contexts)
+                active_index = next(
+                    (
+                        index
+                        for index, context in enumerate(contexts)
+                        if context.config_path == Path(config_path)
+                    ),
+                    0,
+                )
+                try:
+                    return interactive_multi_cluster_menu(contexts, active_index=active_index)
+                finally:
+                    close_cluster_contexts(contexts)
             return result if isinstance(result, int) else 0
+        finally:
+            if not service_handed_off:
+                service.close()
 
 
 def main(argv: list[str] | None = None) -> int:
