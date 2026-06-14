@@ -21,6 +21,17 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(jobs[0].origin, "CLI-managed")
         self.assertEqual(jobs[0].reason_or_node, "sh03-01")
 
+    def test_parse_squeue_jobs_ignores_shell_noise(self):
+        output = (
+            "/etc/profile.d/z99_srcc.sh: line 441: 82496 Killed                  "
+            "$SH_TIMEOUT_CMD 5 find \"${cache}\" -type f -name \"${cmd##*/}_*\" "
+            "\\! -newermt @\"$exp\" -delete &>/dev/null\n"
+            "123|GPU-jupyterlab|RUNNING|gpu|sh03-01|01:23\n"
+        )
+        jobs = parse_squeue_jobs(output, {"123"})
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].job_id, "123")
+
     def test_parse_sacct_job(self):
         job = parse_sacct_job("123|GPU-jupyterlab|COMPLETED|gpu|sh03-01|02:00:00\n", set())
         self.assertIsNotNone(job)

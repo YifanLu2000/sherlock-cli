@@ -24,8 +24,10 @@ def parse_squeue_jobs(output: str, managed_job_ids: set[str]) -> list[JobInfo]:
             continue
         parts = line.split("|")
         if len(parts) != 6:
-            raise ValueError(f"Unexpected squeue output line: {line!r}")
+            continue
         job_id, name, state, partition, reason_or_node, elapsed = [part.strip() for part in parts]
+        if not job_id or not job_id[0].isdigit():
+            continue
         jobs.append(
             JobInfo(
                 job_id=job_id,
